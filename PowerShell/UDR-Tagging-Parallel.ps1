@@ -556,143 +556,183 @@ function Set-OpenXmlProperties {
         [hashtable]$Properties
     )
 
+    # Helper: write an XmlDocument to a ZipArchiveEntry stream with no BOM,
+    # proper XML declaration, and no extra whitespace that can confuse Office.
+    function Write-XmlToZipEntry {
+        param(
+            [System.IO.Compression.ZipArchiveEntry]$Entry,
+            [System.Xml.XmlDocument]$Doc
+        )
+
+        $entryStream = $Entry.Open()
+        try {
+            $settings = New-Object System.Xml.XmlWriterSettings
+            $settings.Encoding           = New-Object System.Text.UTF8Encoding $false  # no BOM
+            $settings.Indent             = $false
+            $settings.OmitXmlDeclaration = $false
+            $settings.CloseOutput        = $false
+
+            $xw = [System.Xml.XmlWriter]::Create($entryStream, $settings)
+            $Doc.Save($xw)
+            $xw.Flush()
+            $xw.Close()
+        }
+        finally {
+            $entryStream.Close()
+        }
+    }
+
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
 
         $tempFile = "$FilePath.tmp"
 
-        # Open original file read-only
-        $sourceZip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        # Remove any leftover temp file from a previous failed run
+        if (Test-Path $tempFile) { Remove-Item $tempFile -Force }
 
-        # Create new archive
+        $sourceZip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
         $targetZip = [System.IO.Compression.ZipFile]::Open($tempFile, 'Create')
 
-        # ------------------------
-        # Copy all entries first
-        # ------------------------
+        # ---------------------------------------------------------------
+        # 1. Copy every entry we are NOT rebuilding
+        # ---------------------------------------------------------------
+        $rebuildParts = @("docProps/custom.xml", "[Content_Types].xml", "_rels/.rels")
+
         foreach ($entry in $sourceZip.Entries) {
+            if ($rebuildParts -contains $entry.FullName) { continue }
 
-            if ($entry.FullName -eq "docProps/custom.xml") {
-                continue # we'll recreate it
-            }
-
-            $newEntry = $targetZip.CreateEntry($entry.FullName)
-
+            $newEntry  = $targetZip.CreateEntry($entry.FullName)
             $inStream  = $entry.Open()
             $outStream = $newEntry.Open()
-
             $inStream.CopyTo($outStream)
-
             $inStream.Close()
             $outStream.Close()
         }
 
-        # ------------------------
-        # Build NEW custom.xml
-        # ------------------------
-        $xml = [xml]@"
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
-            xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
-</Properties>
-"@
+        # ---------------------------------------------------------------
+        # 2. Build docProps/custom.xml from scratch
+        # ---------------------------------------------------------------
+        $customXml = New-Object System.Xml.XmlDocument
+        $customXml.AppendChild($customXml.CreateXmlDeclaration("1.0", "UTF-8", "yes")) | Out-Null
 
-        $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
-        $ns.AddNamespace("cp", "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties")
-        $ns.AddNamespace("vt", "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes")
+        $cpNs = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+        $vtNs = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
 
-        $propertiesNode = $xml.Properties
+        $propsRoot = $customXml.CreateElement("Properties", $cpNs)
+        $propsRoot.SetAttribute("xmlns:vt", $vtNs)
+        $customXml.AppendChild($propsRoot) | Out-Null
 
         $propId = 2
-
         foreach ($key in $Properties.Keys) {
-
-            $value = [string]$Properties[$key]
-
-            $prop = $xml.CreateElement("property", $ns.LookupNamespace("cp"))
+            $prop = $customXml.CreateElement("property", $cpNs)
             $prop.SetAttribute("fmtid", "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}")
-            $prop.SetAttribute("pid", $propId.ToString())
-            $prop.SetAttribute("name", $key)
+            $prop.SetAttribute("pid",   $propId.ToString())
+            $prop.SetAttribute("name",  $key)
 
-            $vt = $xml.CreateElement("vt", "lpwstr", $ns.LookupNamespace("vt"))
-            $vt.InnerText = $value
+            $vtElem           = $customXml.CreateElement("vt:lpwstr", $vtNs)
+            $vtElem.InnerText = [string]$Properties[$key]
 
-            $prop.AppendChild($vt) | Out-Null
-            $propertiesNode.AppendChild($prop) | Out-Null
-
+            $prop.AppendChild($vtElem) | Out-Null
+            $propsRoot.AppendChild($prop) | Out-Null
             $propId++
         }
 
-        # Write custom.xml
         $customEntry = $targetZip.CreateEntry("docProps/custom.xml")
+        Write-XmlToZipEntry -Entry $customEntry -Doc $customXml
 
-        $stream = $customEntry.Open()
-        $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
-        $writer.Write($xml.OuterXml)
-        $writer.Close()
-        $stream.Close()
-
-        # ------------------------
-        # Copy + update .rels safely
-        # ------------------------
-        $relsEntry = $sourceZip.GetEntry("_rels/.rels")
-
-        if ($relsEntry) {
-
-            $stream = $relsEntry.Open()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $relsXml = [xml]$reader.ReadToEnd()
-            $reader.Close()
-            $stream.Close()
-
-            $relNs = New-Object System.Xml.XmlNamespaceManager($relsXml.NameTable)
-            $relNs.AddNamespace("r", "http://schemas.openxmlformats.org/package/2006/relationships")
-
-            $existingRel = $relsXml.SelectSingleNode(
-                "//r:Relationship[@Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties']",
-                $relNs
-            )
-
-            if (-not $existingRel) {
-                $relationships = $relsXml.Relationships
-
-                $nextId = ($relationships.Relationship |
-                    ForEach-Object {
-                        if ($_.Id -match '^rId(\d+)$') { [int]$Matches[1] }
-                    } | Measure-Object -Maximum).Maximum + 1
-
-                $rel = $relsXml.CreateElement("Relationship")
-                $rel.SetAttribute("Id", "rId$nextId")
-                $rel.SetAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties")
-                $rel.SetAttribute("Target", "docProps/custom.xml")
-
-                $relationships.AppendChild($rel) | Out-Null
-            }
-
-            $newRels = $targetZip.CreateEntry("_rels/.rels")
-
-            $stream = $newRels.Open()
-            $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
-            $writer.Write($relsXml.OuterXml)
-            $writer.Close()
-            $stream.Close()
+        # ---------------------------------------------------------------
+        # 3. Patch [Content_Types].xml  — add Override for custom.xml
+        # ---------------------------------------------------------------
+        $ctSourceEntry = $sourceZip.GetEntry("[Content_Types].xml")
+        if (-not $ctSourceEntry) {
+            throw "[Content_Types].xml not found in source archive."
         }
 
+        $ctStream = $ctSourceEntry.Open()
+        $ctXml    = New-Object System.Xml.XmlDocument
+        $ctXml.Load($ctStream)
+        $ctStream.Close()
+
+        $ctNsUri = "http://schemas.openxmlformats.org/package/2006/content-types"
+        $ctNsMgr = New-Object System.Xml.XmlNamespaceManager($ctXml.NameTable)
+        $ctNsMgr.AddNamespace("ct", $ctNsUri)
+
+        $existingOverride = $ctXml.SelectSingleNode(
+            "//ct:Override[@PartName='/docProps/custom.xml']", $ctNsMgr
+        )
+
+        if (-not $existingOverride) {
+            $override = $ctXml.CreateElement("Override", $ctNsUri)
+            $override.SetAttribute("PartName",    "/docProps/custom.xml")
+            $override.SetAttribute("ContentType",
+                "application/vnd.openxmlformats-officedocument.custom-properties+xml")
+            $ctXml.DocumentElement.AppendChild($override) | Out-Null
+        }
+
+        $ctEntry = $targetZip.CreateEntry("[Content_Types].xml")
+        Write-XmlToZipEntry -Entry $ctEntry -Doc $ctXml
+
+        # ---------------------------------------------------------------
+        # 4. Patch _rels/.rels — add Relationship for custom.xml
+        # ---------------------------------------------------------------
+        $relsSourceEntry = $sourceZip.GetEntry("_rels/.rels")
+        if (-not $relsSourceEntry) {
+            throw "_rels/.rels not found in source archive."
+        }
+
+        $relsStream = $relsSourceEntry.Open()
+        $relsXml    = New-Object System.Xml.XmlDocument
+        $relsXml.Load($relsStream)
+        $relsStream.Close()
+
+        $relNsUri = "http://schemas.openxmlformats.org/package/2006/relationships"
+        $relNsMgr = New-Object System.Xml.XmlNamespaceManager($relsXml.NameTable)
+        $relNsMgr.AddNamespace("r", $relNsUri)
+
+        $customPropRelType = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties"
+
+        $existingRel = $relsXml.SelectSingleNode(
+            "//r:Relationship[@Type='$customPropRelType']", $relNsMgr
+        )
+
+        if (-not $existingRel) {
+            # Find the highest existing rId number so we don't collide
+            $maxId = ($relsXml.SelectNodes("//r:Relationship", $relNsMgr) |
+                ForEach-Object {
+                    if ($_.Id -match '^rId(\d+)$') { [int]$Matches[1] }
+                } | Measure-Object -Maximum).Maximum
+
+            $nextId = if ($maxId) { $maxId + 1 } else { 1 }
+
+            $rel = $relsXml.CreateElement("Relationship", $relNsUri)
+            $rel.SetAttribute("Id",     "rId$nextId")
+            $rel.SetAttribute("Type",   $customPropRelType)
+            $rel.SetAttribute("Target", "docProps/custom.xml")
+            $relsXml.DocumentElement.AppendChild($rel) | Out-Null
+        }
+
+        $relsEntry = $targetZip.CreateEntry("_rels/.rels")
+        Write-XmlToZipEntry -Entry $relsEntry -Doc $relsXml
+
+        # ---------------------------------------------------------------
+        # 5. Swap temp over original
+        # ---------------------------------------------------------------
         $sourceZip.Dispose()
         $targetZip.Dispose()
 
-        # Replace original file
         Move-Item -Force $tempFile $FilePath
-
         return $true
     }
     catch {
-        Write-Warning "OpenXML update failed for $FilePath : $($_.Exception.Message)"
+        Write-Warning "Set-OpenXmlProperties failed for '$FilePath': $($_.Exception.Message)"
+        try { $sourceZip.Dispose() } catch {}
+        try { $targetZip.Dispose() } catch {}
+        if (Test-Path "$FilePath.tmp") {
+            Remove-Item "$FilePath.tmp" -Force -ErrorAction SilentlyContinue
+        }
         return $false
     }
 }
-
-
 function Test-FileExists {
     param([string]$fileToTest)
     if (!(Test-Path -Path $fileToTest -PathType Leaf)) {
@@ -2242,7 +2282,7 @@ if ($global:RpcFailureDetected) {
 }
 
 
-$fileToProcess = "C:\Users\KB9\AppData\Local\Temp\Unstructured\labelling\Excel\TestFile1.xlsx"
+$fileToProcess = "C:\Users\keval\OneDrive\Documents\Book1.xlsx"
 Add-Content "$($env:LOCALAPPDATA)\temp\debug.txt" "BEFORE XML: $fileToProcess"
 
 $check = Set-OpenXmlProperties -FilePath $fileToProcess -Properties @{

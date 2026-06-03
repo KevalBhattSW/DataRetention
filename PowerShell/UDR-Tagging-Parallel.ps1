@@ -71,7 +71,7 @@ Function IsOfficeFilePasswordProtected([string]$officeFile) {
     return $hasPassword
 }
 
-
+<#
 function Handle-FileProcessingError {
     param(
         [Parameter(Mandatory)]
@@ -221,6 +221,134 @@ function Handle-FileProcessingError {
     # return [FileErrorAction]::ContinueFile
     return "ContinueFile"
 }
+#>
+
+function Handle-FileProcessingError {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+ 
+        [Parameter(Mandatory)]
+        [string]$File,
+ 
+        [Parameter(Mandatory)]
+        [ref]$Status,
+ 
+        # Cleanup / context
+        $App,
+        $Doc,
+        $Item,
+        [string]$ObjFile,
+        [string]$ProcessedFiles,
+        [string]$SkippedFiles,          # was referenced in body but never declared as param
+        [datetime]$LastWriteTime,
+        [datetime]$LastAccessTime,
+        [int]$MetadataDuration,
+        [bool]$FileReadOnly,
+        [string]$FilePath,
+        [string]$FilePathProgress,
+        [datetime]$StartTime,
+        [string]$Format,
+        [int64]$FileSize
+    )
+ 
+    $ex      = $ErrorRecord.Exception
+    $hresult = $null
+    $msg     = $ex.Message
+ 
+    if ($Status.Value -ne "Document cannot be saved") {
+        if ($ex -is [System.Runtime.InteropServices.COMException]) {
+            $hresult = $ex.HResult
+        }
+        elseif ($ex -is [System.Management.Automation.MethodInvocationException] -and
+                $ex.InnerException -is [System.Runtime.InteropServices.COMException]) {
+            $hresult = $ex.InnerException.HResult
+            $msg     = $ex.InnerException.Message
+        }
+    }
+ 
+    if ($Status.Value -eq "Document cannot be saved") {
+        Write-Warning "$File cannot be saved"
+        Add-ContentSafe -Path $ProcessedFiles -Value $File
+        Add-ContentSafe -Path $SkippedFiles   -Value $File
+        return "ContinueFile"
+    }
+ 
+    # --- COM / RPC classification ---
+    if ($hresult -in 0x800706BE, 0x80010105, 0x800706BA) {
+        Write-Warning ("RPC/COM error on '{0}' (0x{1:X8}): {2}. Continuing." -f $File, $hresult, $msg)
+        Add-ContentSafe -Path $ProcessedFiles -Value $File
+        Add-ContentSafe -Path $SkippedFiles   -Value $File
+        return "ContinueFile"
+    }
+ 
+    if ($hresult) {
+        Write-Warning ("Unhandled COM error on '{0}' (0x{1:X8}): {2}. Continuing." -f $File, $hresult, $msg)
+        Add-ContentSafe -Path $ProcessedFiles -Value $File
+        Add-ContentSafe -Path $SkippedFiles   -Value $File
+        return "ContinueFile"
+    }
+ 
+    # --- Non-COM error ---
+    if ($passwordProtected) {
+        Write-Warning ("Failed on '{0}': {1}. Treating as password-protected." -f $File, $msg)
+        $message = "File is password-protected"
+    }
+    else {
+        Write-Warning ("Failed on '{0}': {1}. Cannot process file." -f $File, $msg)
+        $message = "File could not be processed"
+    }
+ 
+    Add-ContentSafe -Path $ProcessedFiles -Value $File
+    Add-ContentSafe -Path $SkippedFiles   -Value $File
+ 
+    # Cleanup COM
+    if ($App) {
+        try { $App.Quit() } catch {}
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($App) | Out-Null
+    }
+    $Doc = $null
+    $App = $null
+ 
+    # Restore timestamps
+    try {
+        if (-not $Item) { $Item = Get-Item -LiteralPath $File }
+        try {
+            $Item.LastWriteTime  = $LastWriteTime
+            Start-Sleep -Milliseconds $MetadataDuration
+            $Item.LastAccessTime = $LastAccessTime
+            if ($FileReadOnly) { $Item.IsReadOnly = $true }
+        }
+        catch {
+            $restoreMsg = $_.Exception.Message
+            $restoreHR  = if ($_.Exception.HResult) { '{0:X8}' -f $_.Exception.HResult } else { $null }
+            if ($restoreMsg -match 'being used by another process' -or $restoreHR -eq '80070020') {
+                Write-Warning "Handle-FileProcessingError: timestamp restore skipped; file in use: $File ($restoreMsg)"
+            }
+            else {
+                Write-Warning "Handle-FileProcessingError: timestamp restore failed for $File : $restoreMsg (HR=$restoreHR)"
+            }
+        }
+    }
+    catch {
+        Write-Warning "Handle-FileProcessingError: unexpected failure preparing $File : $($_.Exception.Message)"
+    }
+ 
+    # Logging — fixed param names to match Write-Log / Write-LogProcess definitions:
+    #   Write-Log expects -file, not -objFile
+    #   Write-LogProcess expects -startTime as [string], so format the datetime here
+    Write-Log -filePath $FilePath -file $File -message $message
+ 
+    Write-LogProcess -filePath          $FilePathProgress `
+                     -file              $File `
+                     -startTime         $StartTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss") `
+                     -fileFormat        $Format `
+                     -fileSize          $FileSize `
+                     -isPasswordProtected $true
+ 
+    return "ContinueFile"
+}
+ 
 
 
 function Test-Ppt2003HasOpenPassword {
@@ -797,6 +925,7 @@ function Add-ContentSafe {
 }
 
 #Function to loop through a collection of files, check their age and create/update custom document properties
+<#
 function Update-FileAgeProperties {
     param ([System.Collections.ArrayList]$Files,
             [String] $processedFiles) #pass in an existing collection object and list of processed files
@@ -906,7 +1035,14 @@ function Update-FileAgeProperties {
 
         # --- Batch trigger
         if ($openXmlQueue.Count -ge 3) {
-            $jobs += Process-OpenXmlBatch $openXmlQueue
+            $openXmlQueueCopy = @($openXmlQueue)    
+            $jobs += Process-openXmlBatch `
+                -batch $openXmlQueueCopy `
+                -metadataDuration $metadataDuration `
+                -processedFiles $processedFiles `
+                -skippedFiles $skippedFiles `
+                -filepathProgress $filepathProgress
+                -format $format
             $openXmlQueue.Clear()
         }
 
@@ -961,8 +1097,165 @@ function Update-FileAgeProperties {
         }   
 
 }
-
-
+#>
+function Update-FileAgeProperties {
+    param (
+        [System.Collections.ArrayList]$Files,
+        [string]$processedFiles,
+        [string]$skippedFiles      # added — was referenced but never received
+    )
+ 
+    if (!(Test-FileExists -fileToTest $processedFiles)) {
+        return
+    }
+ 
+    $debugFile = "$($env:LOCALAPPDATA)\temp\debug.txt"
+    if (!(Test-Path -Path $debugFile -PathType Leaf)) {
+        New-Item -Path $debugFile -ItemType File -Force | Out-Null
+    }
+ 
+    $Propertylogfolderpath = "$targetDir\PropertyUpdateLogs"
+    if (!(Test-Path $Propertylogfolderpath -PathType Container)) {
+        New-Item -Path $Propertylogfolderpath -ItemType Directory -Force | Out-Null
+    }
+ 
+    $Propertystatusfolderpath = "$targetDir\PropertyUpdateStatus"
+    if (!(Test-Path $Propertystatusfolderpath -PathType Container)) {
+        New-Item -Path $Propertystatusfolderpath -ItemType Directory -Force | Out-Null
+    }
+ 
+    $comQueue     = New-Object System.Collections.ArrayList
+    $openXmlQueue = New-Object System.Collections.ArrayList
+    $pdfQueue     = New-Object System.Collections.ArrayList
+ 
+    $jobs = @()
+ 
+    $timestamp        = Get-Date -Format "yyyyMMdd_HHmmss"
+    $filepath         = "$Propertylogfolderpath\$($timestamp)_AddPropertiesLog.txt"
+    $filepathProgress = "$Propertystatusfolderpath\$($timestamp)_AddPropertiesStatus.txt"
+    $metadataDuration = 100
+ 
+    $logEntryProgress = @("Filename","StartTime","EndTime","Format","Filesize","PasswordProtected") -Join "|"
+    Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
+ 
+    New-Item -Path $filepath -ItemType File -Force | Out-Null
+ 
+    foreach ($file in $Files) {
+ 
+        if ($file -like "*Incentives Newsletter!*.doc") {
+            Write-Output "$file so skipped due to constant (Exception from HRESULT: 0x800706BE) error"
+            continue
+        }
+ 
+        Write-Output $file
+ 
+        if (!(Test-FileExists -fileToTest $file)) {
+            Add-ContentSafe -Path $processedFiles -Value $file
+            Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file not found"
+            Write-Output "$file file not found so skipped"
+            continue
+        }
+ 
+        if (Test-FileLocked -fileToTest $file) {
+            Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file locked/open so skipped"
+            Write-Output "$file file locked/open so skipped"
+            Add-ContentSafe -Path $skippedFiles -Value $file
+            continue
+        }
+ 
+        $item = Get-Item -LiteralPath $file
+ 
+        if ($item.Extension -eq ".pdf") {
+            $pdfQueue.Add($file) | Out-Null
+        }
+        else {
+            $format = (Get-OfficeFormat $file).Format
+            Write-Output "$file -> $format"
+            if ($format -eq "OpenXML") {
+                $openXmlQueue.Add($file) | Out-Null
+            }
+            elseif ($format -eq "BinaryOLE") {
+                $comQueue.Add($file) | Out-Null
+            }
+        }
+ 
+        Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file queued for property update"
+ 
+        # --- Batch triggers ---
+        if ($openXmlQueue.Count -ge 3) {
+            $openXmlQueueCopy = [System.Collections.ArrayList]@($openXmlQueue)
+            $jobs += Process-OpenXmlBatch `
+                -batch            $openXmlQueueCopy `
+                -metadataDuration $metadataDuration `
+                -processedFiles   $processedFiles `
+                -skippedFiles     $skippedFiles `
+                -filepathProgress $filepathProgress `
+                -format           $format `
+                -filePathLog      $filepath
+            $openXmlQueue.Clear()
+        }
+ 
+        if ($pdfQueue.Count -ge 3) {
+            # PDF batch processing placeholder
+            $pdfQueue.Clear()
+        }
+ 
+        if ($comQueue.Count -ge 2) {
+            $comQueueCopy = [System.Collections.ArrayList]@($comQueue)
+            $jobs += Process-ComBatch `
+                -batch            $comQueueCopy `
+                -metadataDuration $metadataDuration `
+                -processedFiles   $processedFiles `
+                -skippedFiles     $skippedFiles `
+                -filepathProgress $filepathProgress `
+                -filePathLog      $filepath
+            $comQueue.Clear()
+        }
+    }
+ 
+    # --- Drain remaining queues ---
+    if ($openXmlQueue.Count -gt 0) {
+        $jobs += Process-OpenXmlBatch `
+            -batch            $openXmlQueue `
+            -metadataDuration $metadataDuration `
+            -processedFiles   $processedFiles `
+            -skippedFiles     $skippedFiles `
+            -filepathProgress $filepathProgress `
+            -format           $format `
+            -filePathLog      $filepath
+    }
+ 
+    if ($pdfQueue.Count -gt 0) {
+        # PDF batch processing placeholder
+        $pdfQueue.Clear()
+    }
+ 
+    if ($comQueue.Count -gt 0) {
+        $jobs += Process-ComBatch `
+            -batch            $comQueue `
+            -metadataDuration $metadataDuration `
+            -processedFiles   $processedFiles `
+            -skippedFiles     $skippedFiles `
+            -filepathProgress $filepathProgress `
+            -filePathLog      $filepath
+    }
+ 
+    # --- Wait for all jobs and collect output ---
+    foreach ($job in $jobs) {
+        $job.AsyncWaitHandle.WaitOne()
+        try {
+            $output = $job.Pipe.EndInvoke($job.Handle)
+            $output
+        }
+        catch {
+            Write-Warning "Runspace error: $($_.Exception.Message)"
+        }
+        finally {
+            $job.Pipe.Dispose()
+        }
+    }
+}
+ 
 
 function Process-PdfBatch{
     param
@@ -1156,7 +1449,7 @@ function Process-PdfBatch{
     return $jobs
 }
 
-
+<#
 function Process-OpenXMLBatch{
     param
         ([System.Collections.ArrayList]$batch `
@@ -1185,11 +1478,10 @@ function Process-OpenXMLBatch{
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
         
-<#        
-        $ps.AddScript('Add-Type -AssemblyName System.IO.Compression.FileSystem')       
-        $ps.AddScript(${function:Test-OfficeEncrypted}.ToString())
-        $ps.AddScript(${function:Set-OpenXmlProperties}.ToString())
-        $ps.AddScript(${function:Add-ContentSafe}.ToString())
+        
+        $ps.AddScript("function Set-OpenXmlProperties { ${function:Set-OpenXmlProperties} }")
+        $ps.AddScript("function Test-OfficeEncrypted { ${function:Test-OfficeEncrypted} }")
+        $ps.AddScript("function Add-ContentSafe { ${function:Add-ContentSafe} }")
 
         $ps.AddScript({
             param($metadataDuration `
@@ -1276,7 +1568,8 @@ function Process-OpenXMLBatch{
                             }
                         }
                         
-                    } elseif ($isPasswordProtected -eq $false -and $isError -eq $false) {
+                    } 
+                    elseif ($isPasswordProtected -eq $false -and $isError -eq $false) {
                         $processed = $true
                     }
                 }
@@ -1326,22 +1619,7 @@ function Process-OpenXMLBatch{
         AddArgument($format).
         AddArgument($filePathLog).
         AddArgument($fileToProcess)
-#>
 
-
-        $ps.AddScript({
-            param($fileToProcess)
-
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-            Add-Content "$($env:LOCALAPPDATA)\temp\debug.txt" "BEFORE XML: $fileToProcess"
-
-            $check = Set-OpenXmlProperties -FilePath $fileToProcess -Properties @{
-                Test = "True"
-            }
-
-            Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProcess $($check)"
-        }).AddArgument($fileToProcess)
 
 
         $jobs += [pscustomobject]@{
@@ -1355,9 +1633,162 @@ function Process-OpenXMLBatch{
     return $jobs
 
 }
+#>
 
+function Process-OpenXmlBatch {
+    param(
+        [System.Collections.ArrayList]$batch,
+        [int]$metadataDuration,
+        [string]$processedFiles,
+        [string]$skippedFiles,
+        [string]$filepathProgress,
+        [string]$format,
+        [string]$filePathLog
+    )
+ 
+    $pool = [runspacefactory]::CreateRunspacePool(1, 3)
+    $pool.Open()
+ 
+    # Capture function definitions once, outside the loop
+    $fnSetOpenXml       = "function Set-OpenXmlProperties { ${function:Set-OpenXmlProperties} }"
+    $fnTestEncrypted    = "function Test-OfficeEncrypted { ${function:Test-OfficeEncrypted} }"
+    $fnAddContentSafe   = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
+ 
+    $jobs = @()
+ 
+    foreach ($fileToProcess in $batch) {
+ 
+        # Skip files that are locked before even spinning up a runspace
+        try {
+            $stream = [System.IO.File]::Open($fileToProcess, 'Open', 'ReadWrite', 'None')
+            $stream.Close()
+        }
+        catch {
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess locked before runspace — skipped"
+            Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
+            continue
+        }
+ 
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+ 
+        # Inject dependencies into the runspace as named functions
+        $ps.AddScript('Add-Type -AssemblyName System.IO.Compression.FileSystem') | Out-Null
+        $ps.AddScript($fnAddContentSafe)    | Out-Null
+        $ps.AddScript($fnTestEncrypted)     | Out-Null
+        $ps.AddScript($fnSetOpenXml)        | Out-Null
+ 
+        $ps.AddScript({
+            param(
+                $metadataDuration,
+                $processedFiles,
+                $skippedFiles,
+                $filepathProgress,
+                $format,
+                $filePathLog,
+                $fileToProcess
+            )
+ 
+            $isError    = $false
+            $processed  = $false
+ 
+            $isPasswordProtected = (Test-OfficeEncrypted -Path $fileToProcess).IsEncrypted
+ 
+            $item              = Get-Item -LiteralPath $fileToProcess
+            $dtLastAccessedDoc = $item.LastAccessTime
+            $dtCreated         = $item.CreationTime
+            $dtLastModified    = $item.LastWriteTime
+            $fileReadOnly      = $item.IsReadOnly
+            $startTime         = Get-Date
+            $startTimeF        = $startTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+            $filesize          = $item.Length
+ 
+            try {
+                if (-not $isPasswordProtected) {
+                    $blProperty18Months  = [bool]((New-TimeSpan -Start $dtLastAccessedDoc -End (Get-Date)).TotalDays -gt 540)
+                    $blProperty3Years    = [bool]((New-TimeSpan -Start $dtCreated         -End (Get-Date)).TotalDays -gt 1095)
+                    $strProperty18Months = if ($blProperty18Months) { "True" } else { "False" }
+                    $strProperty3Years   = if ($blProperty3Years)   { "True" } else { "False" }
+ 
+                    $props = @{
+                        OriginalPath         = $fileToProcess
+                        LastAccessed18Months = $strProperty18Months
+                        Created3Years        = $strProperty3Years
+                    }
+ 
+                    $setResult = Set-OpenXmlProperties -FilePath $fileToProcess -Properties $props
+                    if (-not $setResult) {
+                        $isError = $true
+                        Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess Set-OpenXmlProperties returned false"
+                    }
+                }
+            }
+            catch {
+                $isError = $true
+                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess exception during property update: $($_.Exception.Message)"
+                Write-Output "Failed $fileToProcess : $($_.Exception.Message)"
+            }
+            finally {
+                $endTime  = Get-Date
+                $endTimeF = $endTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+ 
+                # Restore timestamps and log result regardless of outcome
+                try {
+                    $item.LastWriteTime  = $dtLastModified
+                    Start-Sleep -Milliseconds $metadataDuration
+                    $item.LastAccessTime = $dtLastAccessedDoc
+                    if ($fileReadOnly) { $item.IsReadOnly = $true }
+                }
+                catch {
+                    $msg     = $_.Exception.Message
+                    $hresult = if ($_.Exception.HResult) { '{0:X8}' -f $_.Exception.HResult } else { $null }
+                    if ($msg -match 'being used by another process' -or $hresult -eq '80070020') {
+                        Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
+                        Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
+                    }
+                    else {
+                        Write-Warning "Timestamp restore failed for $fileToProcess : $msg (HR=$hresult)"
+                    }
+                }
+ 
+                $logEntryProgress = @($fileToProcess, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected) -Join "|"
+                Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
+                Add-ContentSafe -Path $processedFiles   -Value $fileToProcess
+ 
+                if ($isPasswordProtected) {
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess file is password-protected"
+                    Write-Output "$fileToProcess skipped — password-protected"
+                }
+                elseif ($isError) {
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess properties NOT updated — see error above"
+                    Write-Output "$fileToProcess failed — see log"
+                }
+                else {
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess properties updated"
+                    Write-Output "$fileToProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                }
+            }
+ 
+        }) | Out-Null
+ 
+        $ps.AddArgument($metadataDuration) | Out-Null
+        $ps.AddArgument($processedFiles)   | Out-Null
+        $ps.AddArgument($skippedFiles)     | Out-Null
+        $ps.AddArgument($filepathProgress) | Out-Null
+        $ps.AddArgument($format)           | Out-Null
+        $ps.AddArgument($filePathLog)      | Out-Null
+        $ps.AddArgument($fileToProcess)    | Out-Null
+ 
+        $jobs += [pscustomobject]@{
+            Pipe   = $ps
+            Handle = $ps.BeginInvoke()
+        }
+    }
+ 
+    return $jobs
+}
 
-
+<#
 function Process-COMBatch{
     param
         ([System.Collections.ArrayList]$batch `
@@ -1373,11 +1804,26 @@ function Process-COMBatch{
     $pool = [runspacefactory]::CreateRunspacePool(1,2)
     $pool.Open()
 
+    # Capture function definitions once, outside the loop
+    $fnSetOfficeDoc       = "function Set-OfficeDocCustomProperty { ${function:Set-OfficeDocCustomProperty} }"
+    $fnTestEncrypted    = "function Test-OfficeEncrypted { ${function:Test-OfficeEncrypted} }"
+    $fnTestEncryptedPpt2003    = "function Test-Ppt2003HasOpenPassword { ${function:Test-Ppt2003HasOpenPassword} }"
+    $fnAddContentSafe   = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
+    $fnHandleError   = "function Handle-FileProcessingError { ${function:Handle-FileProcessingError} }"
+
+
     $jobs = @()
     
     foreach ($filePath in $batch) {
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
+
+        $ps.AddScript($fnHandleError)    | Out-Null
+        $ps.AddScript($fnAddContentSafe)    | Out-Null
+        $ps.AddScript($fnTestEncrypted)     | Out-Null
+        $ps.AddScript($fnTestEncryptedPpt2003)     | Out-Null
+        $ps.AddScript($fnSetOfficeDoc)        | Out-Null
+
 
         $ps.AddScript({
             param($metadataDuration `
@@ -1441,72 +1887,8 @@ function Process-COMBatch{
                                     Start-Sleep -MilliSeconds $metadataDuration
                                     continue
                                     }
-                                }                            
-                                else {
-                                       try{
-                                            if($format -eq "OpenXML") {
-                                                if((Test-DocxProtection $file) -ne "NoProtection") {
-                                                    Write-Host "$file so file currently open or locked so skipped"
-                                                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") so $file so file currently open or locked so skipped"
-                                                    Add-ContentSafe -Path $filepath -Value $logEntry
-
-                                                    Add-ContentSafe -Path $processedFiles -Value $file
-
-                                                    Add-ContentSafe -Path $skippedFiles -Value $file                                
-                                                    if($item -eq $null) {
-                                                        $item = Get-Item -LiteralPath $file
-                                                        }
-                                                    $item.LastWriteTime = $dtLastModified
-                                                    Start-Sleep -MilliSeconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-                                                    $item.LastAccessTime = $dtLastAccessedDoc
-                                                    if($fileReadOnly -eq $true) {
-                                                        $item.IsReadOnly = $true
-                                                    }
-                                                    Start-Sleep -MilliSeconds $metadataDuration
-                                                    continue
-                                                }
-                                            }
-                                        }
-                                        catch {
-                                            Write-Error "File is reserved or locked by another user"
-                                            $action = Handle-FileProcessingError `
-                                                -ErrorRecord $_ `
-                                                -File $file `
-                                                -Status ([ref]$status) `
-                                                -App $app `
-                                                -Doc $doc `
-                                                -Item $item `
-                                                -ObjFile $file `
-                                                -ProcessedFiles $processedFiles `
-                                                -LastWriteTime $dtLastModified `
-                                                -LastAccessTime $dtLastAccessedDoc `
-                                                -MetadataDuration $metadataDuration `
-                                                -FileReadOnly $fileReadOnly `
-                                                -FilePath $filePath `
-                                                -FilePathProgress $filePathProgress `
-                                                -StartTime $startTime `
-                                                -Format $format `
-                                                -FileSize $filesize
-
-                                            # if ($action -eq [FileErrorAction]::ContinueFile) {
-                                            if ($action -eq "ContinueFile") {
-                                                Start-Sleep -MilliSeconds $metadataDuration
-                                                continue
-                                                }
-                                            }
- 
-                                    # Write-Host "1"
-							        $app.Visible = $false
-                                    # Write-Host "2"
-							        $doc = $app.Documents.Open($file)
-                                    # Write-Host "3"
-							        $doc.Saved = $false
-                                    # Write-Host "4"
-							        $format = ".doc"
-                                    $officeApp = $true
-                                    # Write-Host "Successfully opened Word document"
-                                    }
-						        }
+                                }
+                            }                            
 
                         catch {
                             $action = Handle-FileProcessingError `
@@ -1576,74 +1958,7 @@ function Process-COMBatch{
                                     continue
                                 }
                             }
-                            else {
-                                       try{
-                                            if($format -eq "OpenXML") {
-                                                if((Test-XlsxProtection $file) -ne "NoProtection") {
-                                                    Write-Host "$file so file currently open or locked so skipped"
-                                                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") so $file so file currently open or locked so skipped"
-                                                    Add-ContentSafe -Path $filepath -Value $logEntry
 
-                                                    Add-ContentSafe -Path $processedFiles -Value $file
-
-                                                    Add-ContentSafe -Path $skippedFiles -Value $file                                
-                                                    if($item -eq $null) {
-                                                        $item = Get-Item -LiteralPath $file
-                                                        }
-                                                    $item.LastWriteTime = $dtLastModified
-                                                    Start-Sleep -MilliSeconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-                                                    $item.LastAccessTime = $dtLastAccessedDoc
-                                                    if($fileReadOnly -eq $true) {
-                                                        $item.IsReadOnly = $true
-                                                    }
-                                                    Start-Sleep -MilliSeconds $metadataDuration
-                                                    continue
-                                                }
-                                            }
-                                        }
-                                        catch {
-                                            Write-Error "File is reserved or locked by another user"
-                                            $action = Handle-FileProcessingError `
-                                                -ErrorRecord $_ `
-                                                -File $file `
-                                                -Status ([ref]$status) `
-                                                -App $app `
-                                                -Doc $doc `
-                                                -Item $item `
-                                                -ObjFile $file `
-                                                -ProcessedFiles $processedFiles `
-                                                -LastWriteTime $dtLastModified `
-                                                -LastAccessTime $dtLastAccessedDoc `
-                                                -MetadataDuration $metadataDuration `
-                                                -FileReadOnly $fileReadOnly `
-                                                -FilePath $filePath `
-                                                -FilePathProgress $filePathProgress `
-                                                -StartTime $startTime `
-                                                -Format $format `
-                                                -FileSize $filesize
-
-                                            # if ($action -eq [FileErrorAction]::ContinueFile) {
-                                            if ($action -eq "ContinueFile") {
-                                                Start-Sleep -MilliSeconds $metadataDuration
-                                                continue
-                                                }
-                                        }
- 
-                                # Write-Host "1"
-						        $app.Visible = $false
-                                # Write-Host "2"
-						        $app.DisplayAlerts = $false
-                                # Write-Host "3"
-						        $app.EnableEvents = $false
-						        $doc = $app.Workbooks.Open($file, 0)
-                                # Write-Host "4"
-						        $doc.CheckCompatibility = $False
-						        $doc.Saved = $false
-                                # Write-Host "5"
-						        $format = ".xls"
-						        $officeApp = $true
-                                # Write-Host "Successfully opened Excel document"
-					        }
                         }
 
                         catch {
@@ -1817,64 +2132,64 @@ function Process-COMBatch{
                 $strProperty18Months = if($blProperty18Months) {"True"} else {"False"}
                 $strProperty3Years =if($blProperty3Years) {"True"} else {"False"}
                 
-                    $propertyExistsOriginalPath = Set-OfficeDocCustomProperty "OriginalPath" $file $doc
-                    $propertyExistsLastAccessed18Months = Set-OfficeDocCustomProperty "LastAccessed18Months" $strProperty18Months $doc
-                    $propertyExistsCreated3Years = Set-OfficeDocCustomProperty "Created3Years" $strProperty3Years $doc
+                $propertyExistsOriginalPath = Set-OfficeDocCustomProperty "OriginalPath" $file $doc
+                $propertyExistsLastAccessed18Months = Set-OfficeDocCustomProperty "LastAccessed18Months" $strProperty18Months $doc
+                $propertyExistsCreated3Years = Set-OfficeDocCustomProperty "Created3Years" $strProperty3Years $doc
 
-                    #$doc.Save()
+                #$doc.Save()
                     
-                    #while ($doc.Saved -eq $false) {
-                     #   start-sleep -milliseconds 100  
-                    #}  
+                #while ($doc.Saved -eq $false) {
+                    #   start-sleep -milliseconds 100  
+                #}  
 
-                    try {
-                        $doc.Save()
-                        $doc.Close()
-                    } 
-                    catch {
-                        $status = "Document cannot be saved"
-                        $action = Handle-FileProcessingError `
-                                -ErrorRecord $_ `
-                                -File $file `
-                                -Status ([ref]$status) `
-                                -App $app `
-                                -Doc $doc `
-                                -Item $item `
-                                -ObjFile $file `
-                                -ProcessedFiles $processedFiles `
-                                -LastWriteTime $dtLastModified `
-                                -LastAccessTime $dtLastAccessedDoc `
-                                -MetadataDuration $metadataDuration `
-                                -FileReadOnly $fileReadOnly `
-                                -FilePath $filePath `
-                                -FilePathProgress $filePathProgress `
-                                -StartTime $startTime `
-                                -Format $format `
-                                -FileSize $filesize
+                try {
+                    $doc.Save()
+                    $doc.Close()
+                } 
+                catch {
+                    $status = "Document cannot be saved"
+                    $action = Handle-FileProcessingError `
+                            -ErrorRecord $_ `
+                            -File $file `
+                            -Status ([ref]$status) `
+                            -App $app `
+                            -Doc $doc `
+                            -Item $item `
+                            -ObjFile $file `
+                            -ProcessedFiles $processedFiles `
+                            -LastWriteTime $dtLastModified `
+                            -LastAccessTime $dtLastAccessedDoc `
+                            -MetadataDuration $metadataDuration `
+                            -FileReadOnly $fileReadOnly `
+                            -FilePath $filePath `
+                            -FilePathProgress $filePathProgress `
+                            -StartTime $startTime `
+                            -Format $format `
+                            -FileSize $filesize
 
-                        if ($action -eq "ContinueFile") {
-                              Start-Sleep -MilliSeconds $metadataDuration
-                              continue
-                        }
-
-                        $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') so $file so file cannot be saved so skipped"
-    	                Add-ContentSafe -Path $filepath -Value $logEntry
-
-                        Add-ContentSafe -Path $processedFiles -Value $file
-
-   		                Add-ContentSafe -Path $skippedFiles -Value $file
-   		                continue
+                    if ($action -eq "ContinueFile") {
+                            Start-Sleep -MilliSeconds $metadataDuration
+                            continue
                     }
+
+                    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') so $file so file cannot be saved so skipped"
+    	            Add-ContentSafe -Path $filepath -Value $logEntry
+
+                    Add-ContentSafe -Path $processedFiles -Value $file
+
+   		            Add-ContentSafe -Path $skippedFiles -Value $file
+   		            continue
+                }
                        
-                    if($format -eq ".xls" -and $app -ne $null) {
-                        $app.EnableEvents = $false
-                    }
-                    if ($app -ne $Null) {
-                        $app.Quit()
-                    }
-                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
-                    $app = $null
-                    $processed = $true
+                if($format -eq ".xls" -and $app -ne $null) {
+                    $app.EnableEvents = $false
+                }
+                if ($app -ne $Null) {
+                    $app.Quit()
+                }
+                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
+                $app = $null
+                $processed = $true
                 
             }
             catch {
@@ -1957,26 +2272,448 @@ function Process-COMBatch{
                     }
                 }
             }
-       }).
-        AddArgument($ScriptPath).
-        AddArgument($metadataDuration).
-        AddArgument($processedFiles).
-        AddArgument($skippedFiles).
-        AddArgument($filepathProgress).
-        AddArgument($format).
-        AddArgument($filePath).
-        AddArgument($file)
-
-        $jobs += @{
-            Pipe = $ps
+       })
+        $ps.AddArgument($metadataDuration) | Out-Null
+        $ps.AddArgument($processedFiles)   | Out-Null
+        $ps.AddArgument($skippedFiles)     | Out-Null
+        $ps.AddArgument($filepathProgress) | Out-Null
+        $ps.AddArgument($format)           | Out-Null
+        $ps.AddArgument($filePathLog)      | Out-Null
+        $ps.AddArgument($fileToProcess)    | Out-Null
+ 
+        $jobs += [pscustomobject]@{
+            Pipe   = $ps
             Handle = $ps.BeginInvoke()
         }
-
     }
-
+ 
     return $jobs
 }
+#>
 
+function Process-COMBatch {
+    param(
+        [System.Collections.ArrayList]$batch,
+        [int]$metadataDuration,
+        [string]$processedFiles,
+        [string]$skippedFiles,
+        [string]$filepathProgress,
+        [string]$format,
+        [string]$filePathLog
+    )
+ 
+    $pool = [runspacefactory]::CreateRunspacePool(1, 2)
+    $pool.Open()
+ 
+    # Capture all required function definitions once, outside the loop
+    $fnSetOfficeDoc         = "function Set-OfficeDocCustomProperty { ${function:Set-OfficeDocCustomProperty} }"
+    $fnTestEncrypted        = "function Test-OfficeEncrypted { ${function:Test-OfficeEncrypted} }"
+    $fnTestEncryptedPpt2003 = "function Test-Ppt2003HasOpenPassword { ${function:Test-Ppt2003HasOpenPassword} }"
+    $fnAddContentSafe       = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
+    $fnHandleError          = "function Handle-FileProcessingError { ${function:Handle-FileProcessingError} }"
+    # Write-Log and Write-LogProcess are called by Handle-FileProcessingError — must also be injected
+    $fnWriteLog             = "function Write-Log { ${function:Write-Log} }"
+    $fnWriteLogProcess      = "function Write-LogProcess { ${function:Write-LogProcess} }"
+ 
+    $jobs = @()
+ 
+    foreach ($filePath in $batch) {
+ 
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+ 
+        $ps.AddScript($fnAddContentSafe)       | Out-Null
+        $ps.AddScript($fnWriteLog)             | Out-Null
+        $ps.AddScript($fnWriteLogProcess)      | Out-Null
+        $ps.AddScript($fnHandleError)          | Out-Null
+        $ps.AddScript($fnTestEncrypted)        | Out-Null
+        $ps.AddScript($fnTestEncryptedPpt2003) | Out-Null
+        $ps.AddScript($fnSetOfficeDoc)         | Out-Null
+ 
+        $ps.AddScript({
+            param(
+                $metadataDuration,
+                $processedFiles,
+                $skippedFiles,
+                $filepathProgress,
+                $format,
+                $filePathLog,
+                $file
+            )
+ 
+            $isError           = $false   # initialise before any branch can reference it
+            $processed         = $false
+            $isPasswordProtected = $false
+            $status            = $null
+            $app               = $null
+            $doc               = $null
+ 
+            # --- Encryption check ---
+            $item = Get-Item -LiteralPath $file   # get item once before the check
+ 
+            if ($item.Extension -eq ".ppt") {     # -eq not = 
+                $isPasswordProtected = Test-Ppt2003HasOpenPassword -Path $file
+            }
+            else {
+                $isPasswordProtected = (Test-OfficeEncrypted -Path $file).IsEncrypted
+            }
+ 
+            $dtLastAccessedDoc = $item.LastAccessTime
+            $dtCreated         = $item.CreationTime
+            $dtLastModified    = $item.LastWriteTime
+            $fileReadOnly      = $item.IsReadOnly
+            $startTime         = Get-Date
+            $startTimeF        = $startTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+            $filesize          = $item.Length
+ 
+            try {
+                switch -regex ($item.Extension) {
+ 
+                    # ----------------------------------------------------------
+                    # Word
+                    # ----------------------------------------------------------
+                    "\.docx|\.docm|\.doc" {
+                        if ($isPasswordProtected -eq $false) {
+                            try {
+                                $app = New-Object -ComObject Word.Application
+                                $app.Visible = $false
+                                $app.DisplayAlerts = 0   # wdAlertsNone
+ 
+                                if ($app -eq $null) {
+                                    Write-Error "Word COM object failed to initialise"
+                                    $action = Handle-FileProcessingError `
+                                        -ErrorRecord      $_ `
+                                        -File             $file `
+                                        -Status           ([ref]$status) `
+                                        -App              $app `
+                                        -Doc              $doc `
+                                        -Item             $item `
+                                        -ObjFile          $file `
+                                        -ProcessedFiles   $processedFiles `
+                                        -SkippedFiles     $skippedFiles `
+                                        -LastWriteTime    $dtLastModified `
+                                        -LastAccessTime   $dtLastAccessedDoc `
+                                        -MetadataDuration $metadataDuration `
+                                        -FileReadOnly     $fileReadOnly `
+                                        -FilePath         $filePathLog `
+                                        -FilePathProgress $filePathProgress `
+                                        -StartTime        $startTime `
+                                        -Format           $format `
+                                        -FileSize         $filesize
+                                    if ($action -eq "ContinueFile") { continue }
+                                }
+                                else {
+                                    $doc = $app.Documents.Open($file, $false, $false)
+                                }
+                            }
+                            catch {
+                                $action = Handle-FileProcessingError `
+                                    -ErrorRecord      $_ `
+                                    -File             $file `
+                                    -Status           ([ref]$status) `
+                                    -App              $app `
+                                    -Doc              $doc `
+                                    -Item             $item `
+                                    -ObjFile          $file `
+                                    -ProcessedFiles   $processedFiles `
+                                    -SkippedFiles     $skippedFiles `
+                                    -LastWriteTime    $dtLastModified `
+                                    -LastAccessTime   $dtLastAccessedDoc `
+                                    -MetadataDuration $metadataDuration `
+                                    -FileReadOnly     $fileReadOnly `
+                                    -FilePath         $filePathLog `
+                                    -FilePathProgress $filePathProgress `
+                                    -StartTime        $startTime `
+                                    -Format           $format `
+                                    -FileSize         $filesize
+                                if ($action -eq "ContinueFile") { continue }
+                            }
+                        }
+                    }
+ 
+                    # ----------------------------------------------------------
+                    # Excel
+                    # ----------------------------------------------------------
+                    "\.xlsx|\.xlsm|\.xls|\.xlsb" {
+                        if ($isPasswordProtected -eq $false) {
+                            try {
+                                $app = New-Object -ComObject Excel.Application
+                                $app.Visible        = $false
+                                $app.DisplayAlerts  = $false
+                                $app.EnableEvents   = $false
+                                $app.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
+ 
+                                if ($app -eq $null) {
+                                    Write-Error "Excel COM object failed to initialise"
+                                    $action = Handle-FileProcessingError `
+                                        -ErrorRecord      $_ `
+                                        -File             $file `
+                                        -Status           ([ref]$status) `
+                                        -App              $app `
+                                        -Doc              $doc `
+                                        -Item             $item `
+                                        -ObjFile          $file `
+                                        -ProcessedFiles   $processedFiles `
+                                        -SkippedFiles     $skippedFiles `
+                                        -LastWriteTime    $dtLastModified `
+                                        -LastAccessTime   $dtLastAccessedDoc `
+                                        -MetadataDuration $metadataDuration `
+                                        -FileReadOnly     $fileReadOnly `
+                                        -FilePath         $filePathLog `
+                                        -FilePathProgress $filePathProgress `
+                                        -StartTime        $startTime `
+                                        -Format           $format `
+                                        -FileSize         $filesize
+                                    if ($action -eq "ContinueFile") { continue }
+                                }
+                                else {
+                                    $doc = $app.Workbooks.Open($file, 0, $false)
+                                }
+                            }
+                            catch {
+                                $action = Handle-FileProcessingError `
+                                    -ErrorRecord      $_ `
+                                    -File             $file `
+                                    -Status           ([ref]$status) `
+                                    -App              $app `
+                                    -Doc              $doc `
+                                    -Item             $item `
+                                    -ObjFile          $file `
+                                    -ProcessedFiles   $processedFiles `
+                                    -SkippedFiles     $skippedFiles `
+                                    -LastWriteTime    $dtLastModified `
+                                    -LastAccessTime   $dtLastAccessedDoc `
+                                    -MetadataDuration $metadataDuration `
+                                    -FileReadOnly     $fileReadOnly `
+                                    -FilePath         $filePathLog `
+                                    -FilePathProgress $filePathProgress `
+                                    -StartTime        $startTime `
+                                    -Format           $format `
+                                    -FileSize         $filesize
+                                if ($action -eq "ContinueFile") { continue }
+                            }
+                        }
+                    }
+ 
+                    # ----------------------------------------------------------
+                    # PowerPoint
+                    # ----------------------------------------------------------
+                    "\.pptx|\.pptm|\.ppt" {
+                        if ($isPasswordProtected -eq $false) {
+                            try {
+                                $app = New-Object -ComObject PowerPoint.Application
+                                $app.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
+ 
+                                if ($app -eq $null) {
+                                    Write-Error "PowerPoint COM object failed to initialise"
+                                    $action = Handle-FileProcessingError `
+                                        -ErrorRecord      $_ `
+                                        -File             $file `
+                                        -Status           ([ref]$status) `
+                                        -App              $app `
+                                        -Doc              $doc `
+                                        -Item             $item `
+                                        -ObjFile          $file `
+                                        -ProcessedFiles   $processedFiles `
+                                        -SkippedFiles     $skippedFiles `
+                                        -LastWriteTime    $dtLastModified `
+                                        -LastAccessTime   $dtLastAccessedDoc `
+                                        -MetadataDuration $metadataDuration `
+                                        -FileReadOnly     $fileReadOnly `
+                                        -FilePath         $filePathLog `
+                                        -FilePathProgress $filePathProgress `
+                                        -StartTime        $startTime `
+                                        -Format           $format `
+                                        -FileSize         $filesize
+                                    if ($action -eq "ContinueFile") { continue }
+                                }
+                                else {
+                                    $doc = $app.Presentations.Open($file, $false, $false, $false)
+                                    $doc.Saved = $false
+                                }
+                            }
+                            catch {
+                                $action = Handle-FileProcessingError `
+                                    -ErrorRecord      $_ `
+                                    -File             $file `
+                                    -Status           ([ref]$status) `
+                                    -App              $app `
+                                    -Doc              $doc `
+                                    -Item             $item `
+                                    -ObjFile          $file `
+                                    -ProcessedFiles   $processedFiles `
+                                    -SkippedFiles     $skippedFiles `
+                                    -LastWriteTime    $dtLastModified `
+                                    -LastAccessTime   $dtLastAccessedDoc `
+                                    -MetadataDuration $metadataDuration `
+                                    -FileReadOnly     $fileReadOnly `
+                                    -FilePath         $filePathLog `
+                                    -FilePathProgress $filePathProgress `
+                                    -StartTime        $startTime `
+                                    -Format           $format `
+                                    -FileSize         $filesize
+                                if ($action -eq "ContinueFile") { continue }
+                            }
+                        }
+                    }
+ 
+                    default {
+                        Write-Warning "No COM handler for extension: $($item.Extension)"
+                    }
+                }
+ 
+                # --- Write properties (doc must be open and non-null to reach here) ---
+                if ($isPasswordProtected -eq $false -and $doc -ne $null) {
+ 
+                    $blProperty18Months  = [bool]((New-TimeSpan -Start $dtLastAccessedDoc -End (Get-Date)).TotalDays -gt 540)
+                    $blProperty3Years    = [bool]((New-TimeSpan -Start $dtCreated         -End (Get-Date)).TotalDays -gt 1095)
+                    $strProperty18Months = if ($blProperty18Months) { "True" } else { "False" }
+                    $strProperty3Years   = if ($blProperty3Years)   { "True" } else { "False" }
+ 
+                    Set-OfficeDocCustomProperty "OriginalPath"         $file                 $doc | Out-Null
+                    Set-OfficeDocCustomProperty "LastAccessed18Months" $strProperty18Months  $doc | Out-Null
+                    Set-OfficeDocCustomProperty "Created3Years"        $strProperty3Years    $doc | Out-Null
+ 
+                    try {
+                        $doc.Save()
+                        $doc.Close()
+                    }
+                    catch {
+                        $status = "Document cannot be saved"
+                        $action = Handle-FileProcessingError `
+                            -ErrorRecord      $_ `
+                            -File             $file `
+                            -Status           ([ref]$status) `
+                            -App              $app `
+                            -Doc              $doc `
+                            -Item             $item `
+                            -ObjFile          $file `
+                            -ProcessedFiles   $processedFiles `
+                            -SkippedFiles     $skippedFiles `
+                            -LastWriteTime    $dtLastModified `
+                            -LastAccessTime   $dtLastAccessedDoc `
+                            -MetadataDuration $metadataDuration `
+                            -FileReadOnly     $fileReadOnly `
+                            -FilePath         $filePathLog `
+                            -FilePathProgress $filePathProgress `
+                            -StartTime        $startTime `
+                            -Format           $format `
+                            -FileSize         $filesize
+                        if ($action -eq "ContinueFile") { continue }
+                    }
+ 
+                    if ($item.Extension -eq ".xls" -and $app -ne $null) {
+                        $app.EnableEvents = $false
+                    }
+                    if ($app -ne $null) {
+                        $app.Quit()
+                        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
+                        $app = $null
+                    }
+ 
+                    $processed = $true
+                }
+            }
+            catch {
+                $isError = $true
+                $action = Handle-FileProcessingError `
+                    -ErrorRecord      $_ `
+                    -File             $file `
+                    -Status           ([ref]$status) `
+                    -App              $app `
+                    -Doc              $doc `
+                    -Item             $item `
+                    -ObjFile          $file `
+                    -ProcessedFiles   $processedFiles `
+                    -SkippedFiles     $skippedFiles `
+                    -LastWriteTime    $dtLastModified `
+                    -LastAccessTime   $dtLastAccessedDoc `
+                    -MetadataDuration $metadataDuration `
+                    -FileReadOnly     $fileReadOnly `
+                    -FilePath         $filePathLog `
+                    -FilePathProgress $filePathProgress `
+                    -StartTime        $startTime `
+                    -Format           $format `
+                    -FileSize         $filesize
+ 
+                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file exception: $($_.Exception.Message)"
+ 
+                if ($app -ne $null) {
+                    try { $app.Quit() } catch {}
+                    try { 
+                        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
+                        $app = $null
+                        [System.GC]::Collect()
+                        [System.GC]::WaitForPendingFinalizers() 
+                    } 
+                    catch {}
+                    $app = $null
+
+
+                }
+ 
+                if ($action -eq "ContinueFile") { continue }
+            }
+            finally {
+                $endTime  = Get-Date
+                $endTimeF = $endTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+ 
+                # Restore timestamps unconditionally
+                try {
+                    $item.LastWriteTime  = $dtLastModified
+                    Start-Sleep -Milliseconds $metadataDuration
+                    $item.LastAccessTime = $dtLastAccessedDoc
+                    if ($fileReadOnly) { $item.IsReadOnly = $true }
+                }
+                catch {
+                    $restoreMsg = $_.Exception.Message
+                    $restoreHR  = if ($_.Exception.HResult) { '{0:X8}' -f $_.Exception.HResult } else { $null }
+                    if ($restoreMsg -match 'being used by another process' -or $restoreHR -eq '80070020') {
+                        Write-Warning "Timestamp restore skipped; file in use: $file ($restoreMsg)"
+                        Add-ContentSafe -Path $skippedFiles -Value $file
+                    }
+                    else {
+                        Write-Warning "Timestamp restore failed for $file : $restoreMsg (HR=$restoreHR)"
+                    }
+                }
+ 
+                # Log outcome
+                $logEntryProgress = @($file, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected) -Join "|"
+                Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
+                Add-ContentSafe -Path $processedFiles   -Value $file
+ 
+                if ($isPasswordProtected) {
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file skipped — password-protected"
+                    Write-Output "$file skipped — password-protected"
+                }
+                elseif ($isError) {
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties NOT updated — see error above"
+                    Write-Output "$file failed — see log"
+                }
+                elseif ($processed) {
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties updated"
+                    Write-Output "$file properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                }
+            }
+ 
+        }) | Out-Null
+ 
+        $ps.AddArgument($metadataDuration)  | Out-Null
+        $ps.AddArgument($processedFiles)    | Out-Null
+        $ps.AddArgument($skippedFiles)      | Out-Null
+        $ps.AddArgument($filepathProgress)  | Out-Null
+        $ps.AddArgument($format)            | Out-Null
+        $ps.AddArgument($filePathLog)       | Out-Null
+        $ps.AddArgument($filePath)          | Out-Null   # the actual file — was $fileToProcess (undefined)
+ 
+        $jobs += [pscustomobject]@{
+            Pipe   = $ps
+            Handle = $ps.BeginInvoke()
+        }
+    }
+ 
+    return $jobs
+}
 
 function Get-ApplicableFiles {
     [CmdletBinding()]
@@ -2261,27 +2998,61 @@ function Invoke-ExecuteTaggingSafely {
             $global:RpcFailureDetected = $true
         }
     }
+
     finally {
         if ($monitorProc) {
+
+            # Wait for any Office processes still alive after Execute_Tagging returns.
+            # COM automation in runspaces can leave WINWORD/EXCEL/POWERPNT briefly
+            # alive after the PowerShell job completes, so we drain them here
+            # before killing the monitor that would have cleaned them up.
+            $officeProcesses  = @('WINWORD', 'EXCEL', 'POWERPNT')
+            $drainTimeoutSecs = 120    # give up after this long regardless
+            $pollIntervalMs   = 2000
+            $elapsed          = 0
+
+            Write-Host "Waiting for Office processes to exit before stopping monitor..."
+
+            while ($elapsed -lt ($drainTimeoutSecs * 1000)) {
+                $remaining = $officeProcesses | Where-Object {
+                    Get-Process -Name $_ -ErrorAction SilentlyContinue
+                }
+
+                if (-not $remaining) {
+                    Write-Host "All Office processes exited."
+                    break
+                }
+
+                Write-Host "Still running: $($remaining -join ', ') — waiting..."
+                Start-Sleep -Milliseconds $pollIntervalMs
+                $elapsed += $pollIntervalMs
+            }
+
+            if ($elapsed -ge ($drainTimeoutSecs * 1000)) {
+                Write-Warning "Drain timeout reached ($drainTimeoutSecs s) — Office processes may still be running. Stopping monitor anyway."
+            }
+
             Stop-KillProcessMonitor -MonitorProcess $monitorProc
         }
-    }
+    }    
+
+}
 
     # Normalize exit code if you're in a pipeline that treats non-zero as failure
     if (-not $global:RpcFailureDetected) {
         $global:LASTEXITCODE = 0
     }
-}
+
 
 $global:RpcFailureDetected = $false
-#Invoke-ExecuteTaggingSafely -Verbose
+Invoke-ExecuteTaggingSafely -Verbose
 
 if ($global:RpcFailureDetected) {
     Write-Host "##[error]Restart required due to RPC failure"
     exit 42
 }
 
-
+<#
 $fileToProcess = "C:\Users\keval\OneDrive\Documents\Book1.xlsx"
 Add-Content "$($env:LOCALAPPDATA)\temp\debug.txt" "BEFORE XML: $fileToProcess"
 
@@ -2290,3 +3061,4 @@ $check = Set-OpenXmlProperties -FilePath $fileToProcess -Properties @{
 }
 
 Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProcess $($check)"
+#>

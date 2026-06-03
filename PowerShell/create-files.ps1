@@ -1,5 +1,5 @@
-﻿# Ensure the target directory exists
-$targetDir = "C:\Users\KB9\AppData\Local\Temp\Unstructured\labelling"
+# Ensure the target directory exists
+$targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\labelling"
 if (!(Test-Path $targetDir)) {
     New-Item -ItemType Directory -Path $targetDir
 }
@@ -190,9 +190,9 @@ function Create-PDFFile {
     param ([string]$strPath,
             [Int]$countFiles)
 
-    $generatedPdf = "C:\Temp\empty.pdf"
+    $generatedPdf = "$($env:LOCALAPPDATA)\temp\empty.pdf"
     for ($i=1; $i -le $countFiles; $i++) {
-        Copy-Item -Path "C:\Temp\empty.pdf" -Destination "$strPath\TestPdf$i.pdf" -Force
+        Copy-Item -Path $generatedPdf -Destination "$strPath\TestPdf$i.pdf" -Force
         $item = Get-Item "$strPath\TestPdf$i.pdf"
         $item.CreationTime = [datetime]"2022-01-01 12:00"
         $item.LastWriteTime = [datetime]"2022-01-01 12:00"

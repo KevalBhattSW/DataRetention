@@ -1304,7 +1304,7 @@ function Process-PdfBatch{
                 , $filepathProgress     `
                 , $format               `
                 , $filePathLog `
-                , $PythonPath `
+                , $pythonPath `
                 , $scriptPath `
                 , $fileToProcess 
             )
@@ -1318,6 +1318,9 @@ function Process-PdfBatch{
             $startTimeF = $startTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
             $filesize = $item.Length
 
+            $isError    = $false
+            $processed  = $false
+
 
 
             try {
@@ -1327,98 +1330,74 @@ function Process-PdfBatch{
                 # Convert boolean values to text strings for Purview to read correctly
                 $strProperty18Months = if($blProperty18Months) {"True"} else {"False"}
                 $strProperty3Years =if($blProperty3Years) {"True"} else {"False"}
-                    $PropertyName = "OriginalPath"
-                    $PropertyValue = $fileToProcess
-                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $fileToProcess) {
-                        1 {$isPasswordProtected = $true}
-                        2 {$isPasswordProtected = $true}
-                        -1 {$isError = $true}
-                        default {
-                            $isPasswordProtected = $false
-                            $isError = $false
-                        }
-                    }
-                    #Start-Sleep -MilliSeconds 2 # If we don't pause here, the dates do not get updated correctly
-                    $PropertyName = "LastAccessed18Months"
-                    $PropertyValue = $strProperty18Months
-                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $fileToProcess) {
-                        1 {$isPasswordProtected = $true}
-                        2 {$isPasswordProtected = $true}
-                        -1 {$isError = $true}
-                        default {
-                            $isPasswordProtected = $false
-                            $isError = $false
-                        }
-                    }
-                    #Start-Sleep -MilliSeconds 2 # If we don't pause here, the dates do not get updated correctly
-                    $PropertyName = "Created3Years"
-                    $PropertyValue = $strProperty3Years
-                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $fileToProcess) {
-                        1 {$isPasswordProtected = $true}
-                        2 {$isPasswordProtected = $true}
-                        -1 {$isError = $true}
-                        default {
-                            $isPasswordProtected = $false
-                            $isError = $false
-                        }
-                    }
-                    if($isPasswordProtected -eq $true) {
-                        #Write to log that file has been updated
-                        try {
-                            $item.LastWriteTime = $dtLastModified
-                            Start-Sleep -MilliSeconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-                            $item.LastAccessTime = $dtLastAccessedDoc
-                            if ($fileReadOnly) { $item.IsReadOnly = $true }
 
-                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - file is password-protected"
-                            Add-ContentSafe -Path $filePathLog -Value $logEntry
-                            
-                            $logEntryProgress = @($fileToProcess, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
-                            Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
 
-                            #Write to processed list that file has been updated
-                            Add-ContentSafe -Path $processedFiles -Value $fileToProcess
-                            Write-Output "$fileToProcess - file is password-protected"
-                        }
-                        catch {
-                            $msg = $_.Exception.Message
-                            $hresult = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
+                $result = & $pythonPath $scriptPath $fileToProcess `
+                    "OriginalPath=$fileToProcess" `
+                    "LastAccessed18Months=$strProperty18Months" `
+                    "Created3Years=$strProperty3Years"
 
-                            if ($msg -match 'being used by another process' -or $hresult -eq '80070020') {
-                                $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - file currently open or locked, properties not set"
-                                Add-ContentSafe -Path $filePathLog -Value $logEntry
-                                Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
-                                Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
-                            } else {
-                                Write-Warning "Timestamp restore failed (unexpected) for $fileToProcess : $msg (HR=$hresult)"
-                            }
-                        }
-                        
-                    } elseif ($isPasswordProtected -eq $false -and $isError -eq $false) {
-                        $processed = $true
-                    try {
-                        $item.LastWriteTime = $dtLastModified
-                        Start-Sleep -MilliSeconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-                        $item.LastAccessTime = $dtLastAccessedDoc
-                        if ($fileReadOnly) { $item.IsReadOnly = $true }
-
-                        $success = $true
-                        $endTime = Get-Date
-                        $endTimeF = $endTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-
-                        #Write to log that file has been updated
-                        $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $file - properties updated"
+                switch ($result) {
+                    1 {$isPasswordProtected = $true}
+                    2 {$isPasswordProtected = $true}
+                    -1 {$isError = $true}
+                    0 {$process = $true}
+                    default {
+                        $isError = $true 
+                        $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - unexpected return code from Python: $result"
                         Add-ContentSafe -Path $filePathLog -Value $logEntry
-
-                        #Write to data that file has been updated
-                        $logEntryProgress = @($fileToProcess, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
-                        Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
-
-                        #Write to processed list that file has been updated
-                        Add-ContentSafe -Path $processedFiles -Value $fileToProcess
-
-                        Write-Output "$fileToProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                     }
+                }
+            }
+            catch {
+                $isError = $true
+                $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - exception calling Python: $($_.Exception.Message)"
+                Add-ContentSafe -Path $filePathLog -Value $logEntry
+            }
+            finally {
+                $endTime = Get-Date
+                $endTimeF = $endTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+
+                try {
+                    $item.LastWriteTime = $dtLastModified
+                    Start-Sleep -MilliSeconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
+                    $item.LastAccessTime = $dtLastAccessedDoc
+                    if ($fileReadOnly) { $item.IsReadOnly = $true }
+                }
+                catch {
+                    $restoreMsg = $_.Exception.Message
+                    $restoreHR = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
+                    if ($restoreMsg -match 'being used by another process' -or $hresult -eq '80070020') {
+                        Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
+                        Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
+                    } 
+                    else {
+                        Write-Warning "Timestamp restore failed for $fileToProcess : $restoreMsg (HR=$restoreHR)"
+                    }
+                }
+                #$logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - file currently open or locked, properties not set"
+                #Add-ContentSafe -Path $filePathLog -Value $logEntry
+                #Write to log that file has been updated
+
+                $logEntryProgress = @($fileToProcess, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
+                Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
+                Add-ContentSafe -Path $processedFiles -Value $fileToProcess
+
+                if($isPasswordProtected -eq $true) {
+                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - file is encrypted or digitally signed"
+                    Add-ContentSafe -Path $filePathLog -Value $logEntry
+                }
+                elseif ($isError) {
+                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess properties NOT updated - see error above"
+                    Add-ContentSafe -Path $filePathLog -Value $logEntry
+                    Write-Output "$fileToProcess failed - see log"
+
+                    Write-Output "$fileToProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                }
+                else {
+                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess properties NOT updated - see error above"
+                    Add-ContentSafe -Path $filePathLog -Value $logEntry
+
                     catch {
                         $msg     = $_.Exception.Message
                         $hresult = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
@@ -1428,27 +1407,25 @@ function Process-PdfBatch{
                             Add-ContentSafe -Path $filePathLog -Value $logEntry
                             Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
                             Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
-                        } else {
-                            Write-Warning "Timestamp restore failed (unexpected) for $fileToProcess : $msg (HR=$hresult)"
+                        } 
+                        else {
+                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") ; $fileToProcess ; properties updated"
+                            Add-ContentSafe -Path $filePathLog -Value $logEntry                        
+                            Write-Output "$filetoProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                         }
                     }                    
                 }
-                Write-Output "Processed $fileToProcess"
             }
-            catch {
-                Write-Output "Failed $fileToProcess"
-            }
-
         })  | Out-Null
-        $ps.AddArgument($metadataDuration).
-        $ps.AddArgument($processedFiles).
-        $ps.AddArgument($skippedFiles).
-        $ps.AddArgument($filepathProgress).
-        $ps.AddArgument($format).
-        $ps.AddArgument($filePathLog).
-        $ps.AddArgument($PythonPath).
-        $ps.AddArgument($scriptPath).
-        $ps.AddArgument($fileToProcess)
+        $ps.AddArgument($metadataDuration)| Out-Null
+        $ps.AddArgument($processedFiles)| Out-Null
+        $ps.AddArgument($skippedFiles)| Out-Null
+        $ps.AddArgument($filepathProgress)| Out-Null
+        $ps.AddArgument($format)| Out-Null
+        $ps.AddArgument($filePathLog)| Out-Null
+        $ps.AddArgument($PythonPath)| Out-Null
+        $ps.AddArgument($scriptPath)| Out-Null
+        $ps.AddArgument($fileToProcess)| Out-Null
 
         
         $jobs += [pscustomobject]@{

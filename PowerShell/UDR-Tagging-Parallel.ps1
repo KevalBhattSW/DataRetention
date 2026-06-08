@@ -1197,6 +1197,15 @@ function Update-FileAgeProperties {
  
         if ($pdfQueue.Count -ge 3) {
             # PDF batch processing placeholder
+            $pdfQueueCopy = [System.Collections.ArrayList]@($pdfQueue)
+            $jobs += Process-PdfBatch `
+                -batch            $pdfQueueCopy `
+                -metadataDuration $metadataDuration `
+                -processedFiles   $processedFiles `
+                -skippedFiles     $skippedFiles `
+                -filepathProgress $filepathProgress `
+                -format           $format `
+                -filePathLog      $filepath
             $pdfQueue.Clear()
         }
  
@@ -1259,30 +1268,34 @@ function Update-FileAgeProperties {
 
 function Process-PdfBatch{
     param
-        ([System.Collections.ArrayList]$batch `
-        , [int]$metadataDuration              `
-        , [string]$processedFiles             `
-        , [string]$skippedFiles               `
-        , [string]$filepathProgress           `
-        , [string]$format                     `
-        , [string]$filePath
+        ([System.Collections.ArrayList]$batch,
+            [int]$metadataDuration,
+            [string]$processedFiles,
+            [string]$skippedFiles,
+            [string]$filepathProgress,
+            [string]$format,
+            [string]$filePathLog
     )
 
     #Python dependencies for PDF updates
-    #$PythonPath = "C:\Program Files\Python313\python.exe"
-    #$ScriptPath = "C:\Temp\update_pdf_properties.py"
-    $PythonPath = "C:\Users\UDRTagging\AppData\Local\Programs\Python\Python313\python.exe"
+    $PythonPath = "C:\Program Files\Python313\python.exe"
     $ScriptPath = "C:\Temp\update_pdf_properties.py"
+    #$PythonPath = "C:\Users\UDRTagging\AppData\Local\Programs\Python\Python313\python.exe"
+    #$ScriptPath = "C:\Temp\update_pdf_properties.py"
 
 
     $pool = [runspacefactory]::CreateRunspacePool(1,3)
     $pool.Open()
 
+    $fnAddContentSafe   = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
+
     $jobs = @()
     
-    foreach ($file in $batch) {
+    foreach ($fileToProcess in $batch) {
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
+        $ps.AddScript($fnAddContentSafe)    | Out-Null
+
 
         $ps.AddScript({
             param($metadataDuration `
@@ -1290,13 +1303,13 @@ function Process-PdfBatch{
                 , $skippedFiles         `
                 , $filepathProgress     `
                 , $format               `
-                , $filepath `
+                , $filePathLog `
                 , $PythonPath `
                 , $scriptPath `
-                , $file 
+                , $fileToProcess 
             )
 
-            $item = Get-Item -LiteralPath $file
+            $item = Get-Item -LiteralPath $fileToProcess
             $dtLastAccessedDoc = $item.LastAccessTime
             $dtCreated         = $item.CreationTime
             $dtLastModified    = $item.LastWriteTime
@@ -1315,8 +1328,8 @@ function Process-PdfBatch{
                 $strProperty18Months = if($blProperty18Months) {"True"} else {"False"}
                 $strProperty3Years =if($blProperty3Years) {"True"} else {"False"}
                     $PropertyName = "OriginalPath"
-                    $PropertyValue = $filePath
-                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $file) {
+                    $PropertyValue = $fileToProcess
+                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $fileToProcess) {
                         1 {$isPasswordProtected = $true}
                         2 {$isPasswordProtected = $true}
                         -1 {$isError = $true}
@@ -1328,7 +1341,7 @@ function Process-PdfBatch{
                     #Start-Sleep -MilliSeconds 2 # If we don't pause here, the dates do not get updated correctly
                     $PropertyName = "LastAccessed18Months"
                     $PropertyValue = $strProperty18Months
-                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $file) {
+                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $fileToProcess) {
                         1 {$isPasswordProtected = $true}
                         2 {$isPasswordProtected = $true}
                         -1 {$isError = $true}
@@ -1340,7 +1353,7 @@ function Process-PdfBatch{
                     #Start-Sleep -MilliSeconds 2 # If we don't pause here, the dates do not get updated correctly
                     $PropertyName = "Created3Years"
                     $PropertyValue = $strProperty3Years
-                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $file) {
+                    switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $fileToProcess) {
                         1 {$isPasswordProtected = $true}
                         2 {$isPasswordProtected = $true}
                         -1 {$isError = $true}
@@ -1357,27 +1370,27 @@ function Process-PdfBatch{
                             $item.LastAccessTime = $dtLastAccessedDoc
                             if ($fileReadOnly) { $item.IsReadOnly = $true }
 
-                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") so $file so file is password-protected"
-                            Add-ContentSafe -Path $filepath -Value $logEntry
+                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - file is password-protected"
+                            Add-ContentSafe -Path $filePathLog -Value $logEntry
                             
-                            $logEntryProgress = @($file, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
+                            $logEntryProgress = @($fileToProcess, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
                             Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
 
                             #Write to processed list that file has been updated
-                            Add-ContentSafe -Path $processedFiles -Value $file
-                            Write-Output "$file so file is password-protected"
+                            Add-ContentSafe -Path $processedFiles -Value $fileToProcess
+                            Write-Output "$fileToProcess - file is password-protected"
                         }
                         catch {
                             $msg = $_.Exception.Message
                             $hresult = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
 
                             if ($msg -match 'being used by another process' -or $hresult -eq '80070020') {
-                                $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") so $file so file currently open or locked, properties not set"
-                                Add-ContentSafe -Path $filepath -Value $logEntry
-                                Write-Warning "Timestamp restore skipped; file in use: $file ($msg)"
-                                Add-ContentSafe -Path $skippedFiles -Value $file
+                                $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - file currently open or locked, properties not set"
+                                Add-ContentSafe -Path $filePathLog -Value $logEntry
+                                Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
+                                Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
                             } else {
-                                Write-Warning "Timestamp restore failed (unexpected) for $file : $msg (HR=$hresult)"
+                                Write-Warning "Timestamp restore failed (unexpected) for $fileToProcess : $msg (HR=$hresult)"
                             }
                         }
                         
@@ -1394,58 +1407,56 @@ function Process-PdfBatch{
                         $endTimeF = $endTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
 
                         #Write to log that file has been updated
-                        $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") so $file so properties updated"
-                        Add-ContentSafe -Path $filepath -Value $logEntry
+                        $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $file - properties updated"
+                        Add-ContentSafe -Path $filePathLog -Value $logEntry
 
                         #Write to data that file has been updated
-                        $logEntryProgress = @($file, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
+                        $logEntryProgress = @($fileToProcess, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected)  -Join "|"
                         Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
 
                         #Write to processed list that file has been updated
-                        Add-ContentSafe -Path $processedFiles -Value $file
+                        Add-ContentSafe -Path $processedFiles -Value $fileToProcess
 
-                        Write-Output "$file properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                        Write-Output "$fileToProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                     }
                     catch {
                         $msg     = $_.Exception.Message
                         $hresult = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
 
                         if ($msg -match 'being used by another process' -or $hresult -eq '80070020') {
-                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") $file file currently open or locked, properties not set"
-                            Add-ContentSafe -Path $filepath -Value $logEntry
-                            Write-Warning "Timestamp restore skipped; file in use: $file ($msg)"
-                            Add-ContentSafe -Path $skippedFiles -Value $file
+                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") $fileToProcess file currently open or locked, properties not set"
+                            Add-ContentSafe -Path $filePathLog -Value $logEntry
+                            Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
+                            Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
                         } else {
-                            Write-Warning "Timestamp restore failed (unexpected) for $file : $msg (HR=$hresult)"
+                            Write-Warning "Timestamp restore failed (unexpected) for $fileToProcess : $msg (HR=$hresult)"
                         }
                     }                    
                 }
-                Write-Output "Processed $file"
+                Write-Output "Processed $fileToProcess"
             }
             catch {
-                Write-Output "Failed $file"
+                Write-Output "Failed $fileToProcess"
             }
 
-        }).
-        AddArgument($ScriptPath).
-        AddArgument($metadataDuration).
-        AddArgument($processedFiles).
-        AddArgument($skippedFiles).
-        AddArgument($filepathProgress).
-        AddArgument($format).
-        AddArgument($filePath).
-        AddArgument($PythonPath).
-        AddArgument($scriptPath).
-        AddArgument($file)
+        })  | Out-Null
+        $ps.AddArgument($metadataDuration).
+        $ps.AddArgument($processedFiles).
+        $ps.AddArgument($skippedFiles).
+        $ps.AddArgument($filepathProgress).
+        $ps.AddArgument($format).
+        $ps.AddArgument($filePathLog).
+        $ps.AddArgument($PythonPath).
+        $ps.AddArgument($scriptPath).
+        $ps.AddArgument($fileToProcess)
 
         
-        $jobs += @{
-            Pipe = $ps
+        $jobs += [pscustomobject]@{
+            Pipe   = $ps
             Handle = $ps.BeginInvoke()
         }
-
     }
-
+ 
     return $jobs
 }
 
@@ -2747,7 +2758,7 @@ function Get-ApplicableFiles {
         Get-ChildItem -LiteralPath $FolderName -File -ErrorAction Stop |
         Where-Object {
             #$_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
-            $_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
+            #$_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
             ($officeExtensions -contains $_.Extension.ToLowerInvariant()) -and
             $_.Name.Substring(0,1) -ne '~' -and
             $_.Length -gt 0
@@ -3007,7 +3018,7 @@ function Invoke-ExecuteTaggingSafely {
             # alive after the PowerShell job completes, so we drain them here
             # before killing the monitor that would have cleaned them up.
             $officeProcesses  = @('WINWORD', 'EXCEL', 'POWERPNT')
-            $drainTimeoutSecs = 120    # give up after this long regardless
+            $drainTimeoutSecs = 1200    # give up after this long regardless
             $pollIntervalMs   = 2000
             $elapsed          = 0
 

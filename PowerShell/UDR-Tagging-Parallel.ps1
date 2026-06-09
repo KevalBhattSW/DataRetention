@@ -1126,7 +1126,7 @@ function Update-FileAgeProperties {
         New-Item -Path $Propertystatusfolderpath -ItemType Directory -Force | Out-Null
     }
     
-    $comParallelItems = 2
+    $comParallelItems = 3
     $openXmlParallelItems = 8
     $pdfParallelItems = 8
 
@@ -1149,7 +1149,7 @@ function Update-FileAgeProperties {
     foreach ($file in $Files) {
  
         if ($file -like "*Incentives Newsletter!*.doc") {
-            Write-Output "$file so skipped due to constant (Exception from HRESULT: 0x800706BE) error"
+            Write-Output "$file - skipped due to constant (Exception from HRESULT: 0x800706BE) error"
             continue
         }
  
@@ -1158,13 +1158,13 @@ function Update-FileAgeProperties {
         if (!(Test-FileExists -fileToTest $file)) {
             Add-ContentSafe -Path $processedFiles -Value $file
             Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file not found"
-            Write-Output "$file file not found so skipped"
+            Write-Output "$file file not found - skipped"
             continue
         }
  
         if (Test-FileLocked -fileToTest $file) {
             Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file locked/open so skipped"
-            Write-Output "$file file locked/open so skipped"
+            Write-Output "$file file locked/open - skipped"
             Add-ContentSafe -Path $skippedFiles -Value $file
             continue
         }
@@ -1225,12 +1225,14 @@ function Update-FileAgeProperties {
                 -processedFiles   $processedFiles `
                 -skippedFiles     $skippedFiles `
                 -filepathProgress $filepathProgress `
-                -filePathLog      $filepath`
+                -format           $format `
+                -filePathLog      $filepath `
                 -parallelItems    $comParallelItems
             $comQueue.Clear()
         }
     }
- 
+    Write-Host "Queue drain commencing"
+
     # --- Drain remaining queues ---
     if ($openXmlQueue.Count -gt 0) {
         $jobs += Process-OpenXmlBatch `
@@ -1240,20 +1242,22 @@ function Update-FileAgeProperties {
             -skippedFiles     $skippedFiles `
             -filepathProgress $filepathProgress `
             -format           $format `
-            -filePathLog      $filepath
+            -filePathLog      $filepath `
+            -parallelItems    $openXmlParallelItems
+        $openXmlQueue.Clear()
     }
  
     if ($pdfQueue.Count -gt 0) {
-        # PDF batch processing placeholder
-            $jobs += Process-PdfBatch `
-                -batch            $pdfQueueCopy `
-                -metadataDuration $metadataDuration `
-                -processedFiles   $processedFiles `
-                -skippedFiles     $skippedFiles `
-                -filepathProgress $filepathProgress `
-                -format           $format `
-                -filePathLog      $filepath
-            $pdfQueue.Clear()
+        $jobs += Process-PdfBatch `
+            -batch            $pdfQueueCopy `
+            -metadataDuration $metadataDuration `
+            -processedFiles   $processedFiles `
+            -skippedFiles     $skippedFiles `
+            -filepathProgress $filepathProgress `
+            -format           $format `
+            -filePathLog      $filepath `
+            -parallelItems    $pdfParallelItems
+        $pdfQueue.Clear()
     }
  
     if ($comQueue.Count -gt 0) {
@@ -1263,7 +1267,10 @@ function Update-FileAgeProperties {
             -processedFiles   $processedFiles `
             -skippedFiles     $skippedFiles `
             -filepathProgress $filepathProgress `
-            -filePathLog      $filepath
+            -format           $format `
+            -filePathLog      $filepath `
+            -parallelItems    $comParallelItems
+        $comQueue.Clear()
     }
  
     # --- Wait for all jobs and collect output ---

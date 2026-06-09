@@ -1197,7 +1197,8 @@ function Update-FileAgeProperties {
                 -skippedFiles     $skippedFiles `
                 -filepathProgress $filepathProgress `
                 -format           $format `
-                -filePathLog      $filepath
+                -filePathLog      $filepath `
+                -parallelItems    $openXmlParallelItems
             $openXmlQueue.Clear()
         }
  
@@ -1211,7 +1212,8 @@ function Update-FileAgeProperties {
                 -skippedFiles     $skippedFiles `
                 -filepathProgress $filepathProgress `
                 -format           $format `
-                -filePathLog      $filepath
+                -filePathLog      $filepath `
+                -parallelItems    $pdfParallelItems
             $pdfQueue.Clear()
         }
  
@@ -1223,7 +1225,8 @@ function Update-FileAgeProperties {
                 -processedFiles   $processedFiles `
                 -skippedFiles     $skippedFiles `
                 -filepathProgress $filepathProgress `
-                -filePathLog      $filepath
+                -filePathLog      $filepath`
+                -parallelItems    $comParallelItems
             $comQueue.Clear()
         }
     }

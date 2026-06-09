@@ -309,6 +309,8 @@ function Handle-FileProcessingError {
     }
     $Doc = $null
     $App = $null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers() 
  
     # Restore timestamps
     try {
@@ -1123,7 +1125,11 @@ function Update-FileAgeProperties {
     if (!(Test-Path $Propertystatusfolderpath -PathType Container)) {
         New-Item -Path $Propertystatusfolderpath -ItemType Directory -Force | Out-Null
     }
- 
+    
+    $comParallelItems = 2
+    $openXmlParallelItems = 8
+    $pdfParallelItems = 8
+
     $comQueue     = New-Object System.Collections.ArrayList
     $openXmlQueue = New-Object System.Collections.ArrayList
     $pdfQueue     = New-Object System.Collections.ArrayList
@@ -1170,7 +1176,7 @@ function Update-FileAgeProperties {
         }
         else {
             $format = (Get-OfficeFormat $file).Format
-            Write-Output "$file -> $format"
+            #Write-Output "$file -> $format"
             if ($format -eq "OpenXML") {
                 $openXmlQueue.Add($file) | Out-Null
             }
@@ -1182,7 +1188,7 @@ function Update-FileAgeProperties {
         Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file queued for property update"
  
         # --- Batch triggers ---
-        if ($openXmlQueue.Count -ge 3) {
+        if ($openXmlQueue.Count -ge $openXmlParallelItems) {
             $openXmlQueueCopy = [System.Collections.ArrayList]@($openXmlQueue)
             $jobs += Process-OpenXmlBatch `
                 -batch            $openXmlQueueCopy `
@@ -1195,7 +1201,7 @@ function Update-FileAgeProperties {
             $openXmlQueue.Clear()
         }
  
-        if ($pdfQueue.Count -ge 3) {
+        if ($pdfQueue.Count -ge $pdfParallelItems) {
             # PDF batch processing placeholder
             $pdfQueueCopy = [System.Collections.ArrayList]@($pdfQueue)
             $jobs += Process-PdfBatch `
@@ -1209,7 +1215,7 @@ function Update-FileAgeProperties {
             $pdfQueue.Clear()
         }
  
-        if ($comQueue.Count -ge 2) {
+        if ($comQueue.Count -ge $comParallelItems) {
             $comQueueCopy = [System.Collections.ArrayList]@($comQueue)
             $jobs += Process-ComBatch `
                 -batch            $comQueueCopy `
@@ -1236,7 +1242,15 @@ function Update-FileAgeProperties {
  
     if ($pdfQueue.Count -gt 0) {
         # PDF batch processing placeholder
-        $pdfQueue.Clear()
+            $jobs += Process-PdfBatch `
+                -batch            $pdfQueueCopy `
+                -metadataDuration $metadataDuration `
+                -processedFiles   $processedFiles `
+                -skippedFiles     $skippedFiles `
+                -filepathProgress $filepathProgress `
+                -format           $format `
+                -filePathLog      $filepath
+            $pdfQueue.Clear()
     }
  
     if ($comQueue.Count -gt 0) {
@@ -1274,7 +1288,8 @@ function Process-PdfBatch{
             [string]$skippedFiles,
             [string]$filepathProgress,
             [string]$format,
-            [string]$filePathLog
+            [string]$filePathLog,
+            [int]$parallelItems
     )
 
     #Python dependencies for PDF updates
@@ -1284,7 +1299,7 @@ function Process-PdfBatch{
     #$ScriptPath = "C:\Temp\update_pdf_properties.py"
 
 
-    $pool = [runspacefactory]::CreateRunspacePool(1,3)
+    $pool = [runspacefactory]::CreateRunspacePool(1,$parallelItems)
     $pool.Open()
 
     $fnAddContentSafe   = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
@@ -1631,10 +1646,11 @@ function Process-OpenXmlBatch {
         [string]$skippedFiles,
         [string]$filepathProgress,
         [string]$format,
-        [string]$filePathLog
+        [string]$filePathLog,
+        [int]$parallelItems
     )
  
-    $pool = [runspacefactory]::CreateRunspacePool(1, 3)
+    $pool = [runspacefactory]::CreateRunspacePool(1, $parallelItems)
     $pool.Open()
  
     # Capture function definitions once, outside the loop
@@ -2287,10 +2303,11 @@ function Process-COMBatch {
         [string]$skippedFiles,
         [string]$filepathProgress,
         [string]$format,
-        [string]$filePathLog
+        [string]$filePathLog,
+        [int]$parallelItems
     )
  
-    $pool = [runspacefactory]::CreateRunspacePool(1, 2)
+    $pool = [runspacefactory]::CreateRunspacePool(1, $parallelItems)
     $pool.Open()
  
     # Capture all required function definitions once, outside the loop
@@ -2597,6 +2614,8 @@ function Process-COMBatch {
                         $app.Quit()
                         [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
                         $app = $null
+                        [System.GC]::Collect()
+                        [System.GC]::WaitForPendingFinalizers() 
                     }
  
                     $processed = $true

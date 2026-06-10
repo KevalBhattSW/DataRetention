@@ -266,12 +266,9 @@ function Handle-FileProcessingError {
         $Item = Get-Item -LiteralPath $ObjFile
     }
 
-    $Item.LastWriteTime = $LastWriteTime
-    Start-Sleep -Milliseconds $MetadataDuration
-    $Item.LastAccessTime = $LastAccessTime
-    if ($FileReadOnly) {
-        $Item.IsReadOnly = $true
-    }
+    Restore-FileMetadata -Item $Item -LastWriteTime $LastWriteTime -LastAccessTime $LastAccessTime `
+        -MetadataDuration $MetadataDuration -RestoreReadOnly:$FileReadOnly `
+        -ObjFile $ObjFile -LogPath $FilePath | Out-Null
 
 
     # Logging
@@ -380,7 +377,81 @@ function Set-OfficeDocCustomProperty {
 	}
 }
 
+# Task 1 (Keval, 2026-04-21): mirror of Set-OfficeDocCustomProperty that returns the value of
+# a custom document property, or $null if the property is not set.
+# Item() is fetched via the same reflection pattern as the setter (so the review stays
+# consistent), but Value is read via direct PowerShell property access - InvokeMember on
+# a late-bound COM property getter can silently return the wrong thing.
+function Get-OfficeDocCustomProperty {
+	[OutputType([string])]
+	Param(
+		[Parameter (Mandatory=$true) ]
+		[string] $PropertyName,
+		[Parameter (Mandatory=$true) ]
+		[System.__ComObject] $Document
+	)
+	try {
+		$customProperties = $Document.CustomDocumentProperties
+		$binding = "System.Reflection.BindingFlags" -as [type]
+		try {
+			$propertyObject = [System.__ComObject].InvokeMember("Item", $binding::GetProperty, $null, $customProperties, $PropertyName)
+			if ($null -eq $propertyObject) { return $null }
+			$value = $propertyObject.Value
+			if ($null -eq $value) { return $null }
+			return [string]$value
+		}
+		catch {
+			# Item() throws when the named property does not exist on the document
+			return $null
+		}
+	}
+	catch {
+		return $null
+	}
+}
+
 #Function to loop through a collection of files, check their age and create/update custom document properties
+# Restore LastWriteTime / LastAccessTime / IsReadOnly on a file, retrying briefly
+# when Office COM or a network share has not yet released its lock. A failure here
+# must not abort the whole tagging run, so the final exception is logged and
+# swallowed.
+function Restore-FileMetadata {
+	param(
+		[Parameter(Mandatory)]$Item,
+		[Parameter(Mandatory)][datetime]$LastWriteTime,
+		[Parameter(Mandatory)][datetime]$LastAccessTime,
+		[int]$MetadataDuration = 100,
+		[bool]$RestoreReadOnly = $false,
+		[string]$ObjFile,
+		[string]$LogPath,
+		[int]$MaxAttempts = 5,
+		[int]$BaseDelayMs = 500
+	)
+
+	$lastException = $null
+	for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+		try {
+			$Item.LastWriteTime = $LastWriteTime
+			Start-Sleep -Milliseconds $MetadataDuration
+			$Item.LastAccessTime = $LastAccessTime
+			if ($RestoreReadOnly) { $Item.IsReadOnly = $true }
+			return $true
+		}
+		catch {
+			$lastException = $_
+			Start-Sleep -Milliseconds ($BaseDelayMs * $attempt)
+		}
+	}
+
+	$msg = "could not restore file metadata after $MaxAttempts attempts: $($lastException.Exception.Message)"
+	if ($LogPath -and $ObjFile -and (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+		try { Write-Log -filePath $LogPath -objFile $ObjFile -message $msg } catch {}
+	}
+	Write-Warning ("{0} - {1}" -f $ObjFile, $msg)
+	return $false
+}
+
+
 function Update-FileAgeProperties{
 	param (
 		[System.Collections.ArrayList] $Files,
@@ -423,7 +494,7 @@ function Update-FileAgeProperties{
     $venvPython = Join-Path $venvDir 'Scripts\python.exe'  # Windows
     $venvActivate = Join-Path $venvDir 'Scripts\python.exe'
     # Get the path to a file in the same folder as this script
-    $ScriptPath = Join-Path $PSScriptRoot '\update_pdf_properties.py'
+    $ScriptPath = Join-Path $PSScriptRoot 'update_pdf_properties.py'
 
     if (Test-Path $ScriptPath) {
         Write-Host "Found file at $ScriptPath"
@@ -432,27 +503,27 @@ function Update-FileAgeProperties{
         $pdfRun = $false
     }
 
-    if($pdfRun){
-        try{
-            # Create venv next to your PowerShell + Python scripts
-            py -$majorMinor -m venv $venvDir
-
-            try {
-                $out = py -$majorMinor -c 'import sys; print(sys.prefix!=sys.base_prefix)' 2>$null
-                if ($out -match 'True') { $activeBySys = $true }
-            } catch { }
-
-            if(!$activeBySys) {
-                # Activate it in PowerShell:
-                $venvActivate
-
-                # Install dependencies inside the venv:
-                py -$majorMinor -m pip install --upgrade pip
-                py -$majorMinor -m pip install pypdf
-                }
+    if ($pdfRun) {
+        try {
+            # Create venv next to the PowerShell + Python scripts if it isn't already there.
+            if (-not (Test-Path $venvPython)) {
+                py -$majorMinor -m venv $venvDir
             }
+
+            # Install dependencies INTO the venv (not the system Python). Using the venv's
+            # own interpreter guarantees pip writes to .venv\Lib\site-packages.
+            # pip itself is provisioned automatically by `python -m venv`, so we don't
+            # try to upgrade it here (PowerShell parses `--upgrade` as one of its own
+            # parameters in some host versions).
+            if (Test-Path $venvPython) {
+                & $venvPython -m pip install pypdf cryptography | Out-Null
+            }
+            else {
+                throw "venv interpreter not found at $venvPython after creation"
+            }
+        }
         catch {
-            Write-Error "Failed to install Python virtual environment. PDF tagging cannot be completed"
+            Write-Error "Failed to install Python virtual environment. PDF tagging cannot be completed. $($_.Exception.Message)"
             $pdfRun = $false
         }
     }
@@ -463,8 +534,14 @@ function Update-FileAgeProperties{
 
     if (Test-Path $venvPython) {
         Write-Host "Venv exists at: $venvDir"
+        # Use the venv's isolated Python for actual PDF tagging. This sidesteps the
+        # Windows App Execution Alias stub (WindowsApps\python.exe) that Get-Command
+        # can return and that produces 'can't open file ... WindowsApps\python.exe
+        # [Errno 22]' when used as the interpreter for update_pdf_properties.py.
+        $PythonPath = $venvPython
     } else {
-        Write-Host "Venv not found (expected $venvPython)"
+        Write-Host "Venv not found (expected $venvPython) - PDF tagging disabled."
+        $pdfRun = $false
     }
 
 	# Define output log file
@@ -484,6 +561,11 @@ function Update-FileAgeProperties{
 	Add-Content -Path $filepathProgress -Value $logEntryProgress
 	# Create the log file
 	New-Item -Path $filepath -ItemType File -Force
+	# Per-run counters passed by [ref] into Handle-FileProcessingError. Must exist
+	# before the loop or `[ref]$status` throws "cannot be applied to a variable
+	# that does not exist" the first time a file fails to open.
+	$status = [pscustomobject]@{ Failed = 0; Succeeded = 0; Skipped = 0 }
+
 	# Loop through each file in collection parameter
 	foreach ($objFile in $Files) {
 		$processed = $false
@@ -659,16 +741,16 @@ function Update-FileAgeProperties{
 			Write-Output "$objFile - file not updatable, properties not set"
 			Write-Output "Detailed Error: $($_.Exception)"
 
+			# Guard COM teardown: if Office already died (e.g. the file failed to open
+			# or the process was killed), Close()/Quit() throw "RPC server unavailable",
+			# which would otherwise escape the loop and abort the whole run.
 			if ($doc -ne $null) {
-				$doc.Close()
-			}
-			
-			if ($app -ne $null) {
-				$app.Quit()
+				try { $doc.Close() } catch { }
 			}
 
 			if ($app -ne $null) {
-				[System.Runtime.InteropServices.Marshal]::ReleaseComObject($app)|Out-Null
+				try { $app.Quit() } catch { }
+				try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null } catch { }
 			}
 			$doc = $null
 			$app = $null
@@ -677,88 +759,124 @@ function Update-FileAgeProperties{
 			if($item -eq $null) {
     			$item = Get-Item $objFile
             }
-			$item.LastWriteTime = $dtLastModified
-			Start-Sleep -Milliseconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-			$item.LastAccessTime = $dtLastAccessedDoc
-			if ($fileReadOnly -eq $true) {
-				$item.IsReadOnly = $true
-			}
+			Restore-FileMetadata -Item $item -LastWriteTime $dtLastModified -LastAccessTime $dtLastAccessedDoc `
+				-MetadataDuration $metadataDuration -RestoreReadOnly:$fileReadOnly `
+				-ObjFile $objFile -LogPath $filePath | Out-Null
 		}
 
 		# If the file has been opened
 		if ($doc -ne $null -or $pdfApp -eq $true){
-			# Test if the file was created over three years ago and accessed over 18 months ago - already tested in file collation
-			$blPropertyLastAccessed = $true
-			$blPropertyCreated = $true
-			
-			#Convert boolean values to text strings for Purview to read correctly
-			$strPropertyLastAccessed = if($blPropertyLastAccessed) {"True"} else {"False"}
-			$strPropertyCreated = if($blPropertyCreated) {"True"} else {"False"}
+			# Task 2: determine bucket from parent-folder location, read (or initialise)
+			# the RetentionStartDate custom property, compute OutOfRetention, then write
+			# the four properties Purview DLP consumes.
+			$bucket = Get-RetentionBucket -FilePath $objFile -Buckets $script:RetentionBuckets
 
-			if($officeApp -eq $True) {
-				$propertyExistsOriginalPath = Set-OfficeDocCustomProperty "OriginalPath" $objFile $doc
-				$propertyExistsLastAccessed = Set-OfficeDocCustomProperty "LastAccessedThreshold" $strPropertyLastAccessed $doc
-				$propertyExistsCreated = Set-OfficeDocCustomProperty "CreatedThreshold" $strPropertyCreated $doc
-				$doc.Save()
-				$doc.Close()
-				if ($format -eq ".xls" -and $app -ne $null) {
-					$app.EnableEvents = $false
+			if (-not $bucket) {
+				# File sits outside any known retention bucket - leave it untouched but
+				# still close the app cleanly so the timestamp restore below works.
+				Write-Log -filePath $filePath -objFile $objFile -message "file not in a recognised retention bucket; skipping retention tagging"
+				Write-Output "$objFile - skipped (no matching retention bucket)"
+				if ($officeApp -eq $true -and $doc -ne $null) {
+					try { $doc.Saved = $true } catch {}
+					try { $doc.Close() } catch {}
+					if ($format -eq ".xls" -and $app -ne $null) { $app.EnableEvents = $false }
+					if ($app -ne $null) {
+						try { $app.Quit() } catch {}
+						[System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
+						$app = $null
+					}
 				}
-			    $app.Quit()
-			    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
-			    $app = $null
-			    $processed = $true
-
 			}
-			elseif($pdfApp -eq $True -and $pdfRun -eq $True) {
-				$PropertyName = "OriginalPath"
-				$PropertyValue = $objFile
-				switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $objFile) {
-					1 {$isPasswordProtected = $true}
-					2 {$isPasswordProtected = $true}
-					-1 {$isError = $true}
-					default {
-						$isPasswordProtected = $false
-						$isPasswordProtected = $false
-						$isError = $false
+			else {
+				# Read an existing RetentionStartDate, if one is already on the file.
+				# PDFs cannot yet be read by the Python helper (TODO below) - they will
+				# be initialised on every pass until update_pdf_properties.py gains a read mode.
+				$retentionStartRaw = $null
+				if ($officeApp -eq $true) {
+					$retentionStartRaw = Get-OfficeDocCustomProperty -PropertyName "RetentionStartDate" -Document $doc
+				}
+
+				$retentionStart = $null
+				if ($retentionStartRaw) {
+					try {
+						$retentionStart = [datetime]::ParseExact($retentionStartRaw, 'yyyy-MM-dd', $null)
+					}
+					catch {
+						Write-Log -filePath $filePath -objFile $objFile -message "RetentionStartDate '$retentionStartRaw' unparseable; resetting to today"
+						$retentionStart = (Get-Date).Date
 					}
 				}
-				
-				$PropertyName = "LastAccessedThreshold"
-				$PropertyValue = $strPropertyLastAccessed
-				switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $objFile) {
-					1 {$isPasswordProtected = $true}
-					2 {$isPasswordProtected = $true}
-					-1 {$isError = $true}
-					default {
-						$isPasswordProtected = $false
-						$isPasswordProtected = $false
-						$isError = $false
+				else {
+					# No existing RetentionStartDate. Try the HR leavers list first
+					# (option 3 from the 2026-05-01 catch-up); if no match, fall
+					# back to today (Keval's "time of run as proxy" - acceptable
+					# for files that arrive after first run).
+					$leaverMatch = $null
+					if ($script:LeaversIndex) {
+						$leaverMatch = Get-LeaverForFile -FilePath $objFile -LeaversIndex $script:LeaversIndex
+					}
+					if ($leaverMatch) {
+						$retentionStart = $leaverMatch.LeaveDate
+						Write-Log -filePath $filePath -objFile $objFile `
+							-message ("matched leaver {0} (ID '{1}'); using leave date {2:yyyy-MM-dd}" -f $leaverMatch.EmployeeName, $leaverMatch.EmployeeID, $leaverMatch.LeaveDate)
+					}
+					else {
+						$retentionStart = (Get-Date).Date
 					}
 				}
-				$PropertyName = "CreatedThreshold"
-				$PropertyValue = $strPropertyCreated
-				switch (& $PythonPath $ScriptPath $PropertyName $PropertyValue $objFile) {
-					1 {$isPasswordProtected = $true}
-					2 {$isPasswordProtected = $true}
-					-1 {$isError = $true}
-					default {
-						$isPasswordProtected = $false
-						$isPasswordProtected = $false
-						$isError = $false
+
+				$retentionStartStr    = $retentionStart.ToString('yyyy-MM-dd')
+				$isOutOfRetention     = ($retentionStart.AddYears($bucket.Years) -lt (Get-Date).Date)
+				$outOfRetentionStr    = if ($isOutOfRetention) { "True" } else { "False" }
+				$retentionCategoryStr = $bucket.Name
+
+				if ($officeApp -eq $true) {
+					[void](Set-OfficeDocCustomProperty "OriginalPath"       $objFile              $doc)
+					[void](Set-OfficeDocCustomProperty "RetentionStartDate" $retentionStartStr    $doc)
+					[void](Set-OfficeDocCustomProperty "OutOfRetention"     $outOfRetentionStr    $doc)
+					[void](Set-OfficeDocCustomProperty "RetentionCategory"  $retentionCategoryStr $doc)
+					$doc.Save()
+					$doc.Close()
+					if ($format -eq ".xls" -and $app -ne $null) {
+						$app.EnableEvents = $false
+					}
+					$app.Quit()
+					[System.Runtime.InteropServices.Marshal]::ReleaseComObject($app) | Out-Null
+					$app = $null
+					$processed = $true
+				}
+				elseif ($pdfApp -eq $true -and $pdfRun -eq $true) {
+					# TODO: update_pdf_properties.py needs a read mode so PDFs can re-use an
+					# existing RetentionStartDate across runs. Until then, every pass writes
+					# today's date as the start - which is fine for the first ever run but
+					# means PDFs already in retention-land will have their clock reset.
+					$pdfProps = [ordered]@{
+						"OriginalPath"       = $objFile
+						"RetentionStartDate" = $retentionStartStr
+						"OutOfRetention"     = $outOfRetentionStr
+						"RetentionCategory"  = $retentionCategoryStr
+					}
+					foreach ($name in $pdfProps.Keys) {
+						$value = $pdfProps[$name]
+						switch (& $PythonPath $ScriptPath $name $value $objFile) {
+							1  { $isPasswordProtected = $true }
+							2  { $isPasswordProtected = $true }
+							-1 { $isError = $true }
+							default {
+								$isPasswordProtected = $false
+								$isError = $false
+							}
+						}
 					}
 				}
 			}
 
 			if ($isPasswordProtected -eq $true) {
 				#Write to log that file has been updated
-				$item.LastWriteTime = $dtLastModified
-				Start-Sleep -Milliseconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-				$item.LastAccessTime = $dtLastAccessedDoc
-				if ($fileReadOnly -eq $true) {
-					$item.IsReadOnly = $true
-				}
-		
+				Restore-FileMetadata -Item $item -LastWriteTime $dtLastModified -LastAccessTime $dtLastAccessedDoc `
+					-MetadataDuration $metadataDuration -RestoreReadOnly:$fileReadOnly `
+					-ObjFile $objFile -LogPath $filePath | Out-Null
+
 				Write-Log -filePath $filePath -objFile $objFile -message "file is password-protected"
 				Write-LogProcess -filePath $filePathProgress -objFile $objFile -startTime $startTime -fileFormat $format -fileSize $filesize -isPasswordProtected $isPasswordProtected
 
@@ -772,12 +890,9 @@ function Update-FileAgeProperties{
 
 			if ($processed -eq $true) {
 				# Update file timestamps
-				$item.LastWriteTime = $dtLastModified
-				Start-Sleep -Milliseconds $metadataDuration # If we don't pause here, the dates do not get updated correctly
-				$item.LastAccessTime = $dtLastAccessedDoc
-				if($fileReadOnly -eq $true) {
-					$item.IsReadOnly = $true
-				}
+				Restore-FileMetadata -Item $item -LastWriteTime $dtLastModified -LastAccessTime $dtLastAccessedDoc `
+					-MetadataDuration $metadataDuration -RestoreReadOnly:$fileReadOnly `
+					-ObjFile $objFile -LogPath $filePath | Out-Null
 				$success = $true
 				$endTime = Get-Date
 				$endTimeF = $endTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
@@ -795,6 +910,43 @@ function Update-FileAgeProperties{
 
 
 
+# Retention buckets. Folder names under the labelling root map to retention periods in years.
+# Get-RetentionBucket walks up each file's parents and returns the first match.
+$script:RetentionBuckets = [ordered]@{
+    'PAST EMPLOYEES - FILES' = 7
+}
+
+# Walk up a file's parent folders until we find a folder name that matches one of the
+# configured retention buckets. Returns an object with Name (the bucket folder name) and
+# Years (retention period). Returns $null if the file sits outside any known bucket.
+function Get-RetentionBucket {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string] $FilePath,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $Buckets
+    )
+
+    $dir = Split-Path -Path $FilePath -Parent
+    while ($dir) {
+        $name = Split-Path -Path $dir -Leaf
+        if ($Buckets.Contains($name)) {
+            return [pscustomobject]@{
+                Name  = $name
+                Years = [int]$Buckets[$name]
+            }
+        }
+        $parent = Split-Path -Path $dir -Parent
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return $null
+}
+
+# Task 2 rewrite. Replaces the old age-threshold-based filter. A file is "applicable"
+# if it (a) has a supported Office/PDF extension AND (b) sits under a recognised
+# retention bucket folder (6/7/10 year). The actual in-or-out-of-retention decision
+# happens per-file inside Update-FileAgeProperties, not here.
 function Get-ApplicableFiles {
     [CmdletBinding()]
     [OutputType([System.Collections.ArrayList])]
@@ -803,27 +955,14 @@ function Get-ApplicableFiles {
         [string] $FolderName,
 
         [Parameter(Mandatory)]
-        [int] $LastAccessedMonths,
-
-        [Parameter(Mandatory)]
-        [int] $CreatedMonths
+        [System.Collections.IDictionary] $Buckets
     )
 
-    # Validate folder
     if (-not (Test-Path -LiteralPath $FolderName -PathType Container)) {
         Write-Error "Folder '$FolderName' does not exist."
         return [System.Collections.ArrayList]::new()
     }
 
-    # Normalize months
-    $lastAccessedMonthsAbs = [math]::Abs($LastAccessedMonths)
-    $createdMonthsAbs     = [math]::Abs($CreatedMonths)
-
-    # Threshold dates
-    $lastAccessThreshold = (Get-Date).AddMonths(-$lastAccessedMonthsAbs)
-    $creationThreshold   = (Get-Date).AddMonths(-$createdMonthsAbs)
-
-    # Allowed extensions
     $officeExtensions = @(
         ".doc", ".docx", ".docm",
         ".xls", ".xlsx", ".xlsm", ".xlsb",
@@ -834,30 +973,16 @@ function Get-ApplicableFiles {
     $result = [System.Collections.ArrayList]::new()
 
     try {
-        # Process files in current folder
-        Get-ChildItem -LiteralPath $FolderName -File -ErrorAction Stop |
+        Get-ChildItem -LiteralPath $FolderName -File -Recurse -ErrorAction Stop |
         Where-Object {
-            $_.LastAccessTime -lt $lastAccessThreshold -and
-            $_.CreationTime   -lt $creationThreshold -and
-            ($officeExtensions -contains $_.Extension.ToLowerInvariant())
+            # Skip Office owner/lock files (~$name.docx) - they aren't real documents,
+            # they fail to open via COM, and that failure triggers the error cascade.
+            (-not $_.Name.StartsWith('~$')) -and
+            ($officeExtensions -contains $_.Extension.ToLowerInvariant()) -and
+            (Get-RetentionBucket -FilePath $_.FullName -Buckets $Buckets)
         } |
         ForEach-Object {
             [void]$result.Add($_.FullName)
-        }
-
-        # Recurse into subfolders
-        Get-ChildItem -LiteralPath $FolderName -Directory -ErrorAction Stop |
-        ForEach-Object {
-            Write-Verbose "Recursing into subfolder: $($_.FullName)"
-
-            $childResults = Get-ApplicableFiles `
-                -FolderName $_.FullName `
-                -LastAccessedMonths $lastAccessedMonthsAbs `
-                -CreatedMonths $createdMonthsAbs
-
-            foreach ($child in $childResults) {
-                [void]$result.Add($child)
-            }
         }
     }
     catch {
@@ -865,6 +990,166 @@ function Get-ApplicableFiles {
     }
 
     return $result
+}
+
+
+# ---- Task 3 (Arven, 2026-05-05; spec from catch-up call 2026-05-01) ----
+# HR leavers-list match. When HR provides Leavers.csv with EmployeeName,
+# EmployeeID, LeaveDate, we resolve files to a leaver and use the leave date
+# as RetentionStartDate instead of stamping today. Two-hashtable lookup
+# (by ID + by name) per Keval's suggestion on the call. Falls back to
+# today when no CSV is loaded or no row matches, so the existing test-bed
+# pipeline is unaffected if HR hasn't shipped the list yet.
+
+# Tokenise a name/path candidate into lowercase alphanumeric chunks. Used
+# for both ID lookup (token equality) and name match (subset comparison).
+function ConvertTo-LeaverTokens {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([string] $Text)
+    if (-not $Text) { return @() }
+    return @(($Text -split '[^A-Za-z0-9]+') |
+             Where-Object { $_.Length -gt 0 } |
+             ForEach-Object { $_.ToLowerInvariant() })
+}
+
+# Read HR's leavers CSV and build two indices: one keyed by lower-cased
+# Employee ID, one keyed by sorted-and-joined name tokens. Returns $null
+# if the CSV does not exist - callers should treat that as "leavers match
+# disabled" and fall through to the today-as-start behaviour.
+function Import-LeaversList {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][string] $CsvPath
+    )
+
+    if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
+        Write-Warning "Leavers CSV '$CsvPath' not found - leaver matching disabled."
+        return $null
+    }
+
+    # Expected columns: EmployeeName, EmployeeID, LeaveDate. Date format
+    # ideally yyyy-MM-dd; we accept several common formats since HR may
+    # export from different systems (Excel, Sage, etc.).
+    $rows = Import-Csv -LiteralPath $CsvPath
+    $byId   = @{}
+    $byName = @{}
+    $ambiguous = New-Object System.Collections.Generic.HashSet[string]
+    $acceptedFormats = @('yyyy-MM-dd','dd/MM/yyyy','MM/dd/yyyy','d MMM yyyy','dd-MM-yyyy','yyyy/MM/dd')
+
+    foreach ($row in $rows) {
+        $id      = if ($row.EmployeeID)   { "$($row.EmployeeID)".Trim()   } else { '' }
+        $name    = if ($row.EmployeeName) { "$($row.EmployeeName)".Trim() } else { '' }
+        $rawDate = if ($row.LeaveDate)    { "$($row.LeaveDate)".Trim()    } else { '' }
+
+        if (-not $id -and -not $name) { continue }
+
+        $leaveDate = $null
+        foreach ($fmt in $acceptedFormats) {
+            try { $leaveDate = [datetime]::ParseExact($rawDate, $fmt, $null); break } catch {}
+        }
+        if (-not $leaveDate) {
+            try { $leaveDate = [datetime]::Parse($rawDate) } catch {}
+        }
+        if (-not $leaveDate) {
+            Write-Warning "Leaver row skipped (unparseable LeaveDate '$rawDate'): name='$name' id='$id'"
+            continue
+        }
+
+        $nameTokens = @(ConvertTo-LeaverTokens $name | Sort-Object -Unique)
+        $record = [pscustomobject]@{
+            EmployeeID   = $id
+            EmployeeName = $name
+            LeaveDate    = $leaveDate.Date
+            NameTokens   = $nameTokens
+        }
+
+        if ($id) {
+            $key = $id.ToLowerInvariant()
+            if ($byId.ContainsKey($key)) {
+                Write-Warning "Duplicate EmployeeID '$id' in leavers CSV - last entry wins."
+            }
+            $byId[$key] = $record
+        }
+
+        # Single-token names (e.g. just "Smith") are too risky for path
+        # matching - they collide with file/folder words. Require >=2
+        # distinct tokens before registering for name lookup.
+        if ($nameTokens.Count -ge 2) {
+            $nameKey = ($nameTokens -join '')
+            if ($byName.ContainsKey($nameKey) -and $byName[$nameKey] -ne $record) {
+                # Two leavers with the same normalised name - mark
+                # ambiguous and refuse to match by name for that key.
+                [void]$ambiguous.Add($nameKey)
+            } else {
+                $byName[$nameKey] = $record
+            }
+        }
+    }
+
+    foreach ($k in @($ambiguous)) { $byName.Remove($k) | Out-Null }
+
+    return @{
+        ById   = $byId
+        ByName = $byName
+    }
+}
+
+# Match a file to a leaver: ID first (high precision), then name tokens
+# (medium precision). Returns $null when no confident match exists. Looks
+# at the filename stem and every parent folder name up to the root, so
+# layouts like \Leavers\General-6yr\EMP12345 - John Smith\file.docx work.
+function Get-LeaverForFile {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]    $FilePath,
+        [Parameter(Mandatory)][hashtable] $LeaversIndex
+    )
+
+    # Collect candidate strings: filename stem + each parent folder name.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add([System.IO.Path]::GetFileNameWithoutExtension($FilePath))
+    $dir = Split-Path -Path $FilePath -Parent
+    while ($dir) {
+        $candidates.Add((Split-Path -Path $dir -Leaf))
+        $parent = Split-Path -Path $dir -Parent
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $dir) { break }
+        $dir = $parent
+    }
+
+    # 1. ID match. Tokenise each candidate and look for the ID as a whole
+    # token so "EMP12345" doesn't accidentally match "EMP123450".
+    if ($LeaversIndex.ById.Count -gt 0) {
+        foreach ($candidate in $candidates) {
+            foreach ($tok in (ConvertTo-LeaverTokens $candidate)) {
+                if ($LeaversIndex.ById.ContainsKey($tok)) {
+                    return $LeaversIndex.ById[$tok]
+                }
+            }
+        }
+    }
+
+    # 2. Name match. A leaver matches if every token of their name is
+    # present (in any order) in the candidate's token set.
+    if ($LeaversIndex.ByName.Count -gt 0) {
+        foreach ($candidate in $candidates) {
+            $candidateTokens = @(ConvertTo-LeaverTokens $candidate)
+            if ($candidateTokens.Count -eq 0) { continue }
+            $candidateSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$candidateTokens, [System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($key in $LeaversIndex.ByName.Keys) {
+                $record = $LeaversIndex.ByName[$key]
+                $allPresent = $true
+                foreach ($t in $record.NameTokens) {
+                    if (-not $candidateSet.Contains($t)) { $allPresent = $false; break }
+                }
+                if ($allPresent) { return $record }
+            }
+        }
+    }
+
+    return $null
 }
 
 
@@ -877,10 +1162,30 @@ function Execute_Tagging() {
         New-Item -Path $filePathBase -ItemType Container -Force 
     }
 
-	# Define the folder path
-	$FolderName = "$filePathBase\Unstructured\labelling"
-	#$FolderName = (Get-Content -Path "$filePathBase\searchpath.txt").Trim()
-	Write-Host "Folder Nameis: $FolderName"
+	# Labelling root - the top-level HR share the scanner walks.
+	$FolderName = "\\UK-GH-PURVIEW01\HRDataOld\HR Data"
+	Write-Host "Folder Name: $FolderName"
+
+	if (-not (Test-Path -LiteralPath $FolderName -PathType Container)) {
+		Write-Error "Labelling root '$FolderName' does not exist or is not reachable from this host."
+		return
+	}
+
+	# Optional HR leavers list. Drop a Leavers.csv (EmployeeName, EmployeeID,
+	# LeaveDate) at the path below to enable per-leaver retention dates.
+	# Pipeline still works without it - Update-FileAgeProperties just falls
+	# back to today's date as RetentionStartDate when no match is found.
+	$script:LeaversIndex = $null
+	$leaversCsv = "$filePathBase\Unstructured\Leavers.csv"
+	if (Test-Path -LiteralPath $leaversCsv -PathType Leaf) {
+		$script:LeaversIndex = Import-LeaversList -CsvPath $leaversCsv
+		if ($script:LeaversIndex) {
+			Write-Host ("Leavers list loaded from {0}: {1} by ID, {2} by name" -f $leaversCsv, $script:LeaversIndex.ById.Count, $script:LeaversIndex.ByName.Count)
+		}
+	}
+	else {
+		Write-Host "No Leavers.csv found at $leaversCsv - leaver matching disabled (today will be used as retention start)."
+	}
  
 	# Define the file collection location
 	$targetDir = "$filePathBase\Unstructured"
@@ -933,7 +1238,7 @@ function Execute_Tagging() {
 		if($filesToScanUnique -eq $null) {
 			$filesToScanUnique=[System.Collections.ArrayList]::new()
 		}
-		$filesToScan = Get-ApplicableFiles -FolderName $FolderName -LastAccessedMonths 0 -CreatedMonths 1
+		$filesToScan = Get-ApplicableFiles -FolderName $FolderName -Buckets $script:RetentionBuckets
 		if($filesToScan.Count -ne 0) {
 			$filesToScanUnique = $filesToScan | sort -Unique
 			foreach ($file in $filesToScanUnique) {
@@ -1116,8 +1421,16 @@ function Stop-KillProcessMonitor {
 
 function Invoke-ExecuteTaggingSafely {
 
+    # Kill-monitor log lives next to the regular run logs, so we are not
+    # dependent on C:\temp existing on the VDI. Created if absent.
+    $killLogDir = Join-Path $Env:LOCALAPPDATA 'Temp\Unstructured'
+    if (-not (Test-Path -LiteralPath $killLogDir -PathType Container)) {
+        New-Item -Path $killLogDir -ItemType Directory -Force | Out-Null
+    }
+    $killLogPath = Join-Path $killLogDir 'KillProcess.log'
+
     # Start the external monitor process (hidden)
-    $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 60 -LogPath "C:\temp\KillProcess.log" -ShowWindow -NoExit
+    $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 60 -LogPath $killLogPath -ShowWindow -NoExit
 
     $taggingFailed = $false
 

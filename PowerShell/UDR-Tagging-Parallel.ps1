@@ -1190,7 +1190,7 @@ function Update-FileAgeProperties {
         # --- Batch triggers ---
         if ($openXmlQueue.Count -ge $openXmlParallelItems) {
             $openXmlQueueCopy = [System.Collections.ArrayList]@($openXmlQueue)
-            $jobs += Process-OpenXmlBatch `
+            $batchJobs = Process-OpenXmlBatch `
                 -batch            $openXmlQueueCopy `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
@@ -1199,13 +1199,16 @@ function Update-FileAgeProperties {
                 -format           $format `
                 -filePathLog      $filepath `
                 -parallelItems    $openXmlParallelItems
+            if($batchJobs -ne $null) {
+                $jobs += $batchJobs
+            }
             $openXmlQueue.Clear()
         }
  
         if ($pdfQueue.Count -ge $pdfParallelItems) {
             # PDF batch processing placeholder
             $pdfQueueCopy = [System.Collections.ArrayList]@($pdfQueue)
-            $jobs += Process-PdfBatch `
+            $batchJobs = Process-PdfBatch `
                 -batch            $pdfQueueCopy `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
@@ -1214,12 +1217,15 @@ function Update-FileAgeProperties {
                 -format           $format `
                 -filePathLog      $filepath `
                 -parallelItems    $pdfParallelItems
+            if($batchJobs -ne $null) {
+                $jobs += $batchJobs
+            }
             $pdfQueue.Clear()
         }
  
         if ($comQueue.Count -ge $comParallelItems) {
             $comQueueCopy = [System.Collections.ArrayList]@($comQueue)
-            $jobs += Process-ComBatch `
+            $batchJobs = Process-ComBatch `
                 -batch            $comQueueCopy `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
@@ -1228,15 +1234,20 @@ function Update-FileAgeProperties {
                 -format           $format `
                 -filePathLog      $filepath `
                 -parallelItems    $comParallelItems
+            if($batchJobs -ne $null) {
+                $jobs += $batchJobs
+            }
             $comQueue.Clear()
         }
     }
     Write-Host "Queue drain commencing"
 
     # --- Drain remaining queues ---
+    Write-Host "Checking openXml queue - count: $($openXmlQueue.Count)"
     if ($openXmlQueue.Count -gt 0) {
-        $jobs += Process-OpenXmlBatch `
-            -batch            $openXmlQueue `
+        Write-Host "Calling XML drain"
+        $batchJobs = Process-OpenXmlBatch `
+            -batch            $openXmlQueueCopy `
             -metadataDuration $metadataDuration `
             -processedFiles   $processedFiles `
             -skippedFiles     $skippedFiles `
@@ -1244,11 +1255,17 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $openXmlParallelItems
+        if($batchJobs -ne $null) {
+            $jobs += $batchJobs
+        }
+        Write-Host "XML drained"
         $openXmlQueue.Clear()
     }
  
+    Write-Host "Checking PDF queue - count: $($pdfQueue.Count)"
     if ($pdfQueue.Count -gt 0) {
-        $jobs += Process-PdfBatch `
+        Write-Host "Calling PDF drain"
+        $batchJobs = Process-PdfBatch `
             -batch            $pdfQueueCopy `
             -metadataDuration $metadataDuration `
             -processedFiles   $processedFiles `
@@ -1257,12 +1274,17 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $pdfParallelItems
+        if($batchJobs -ne $null) {
+            $jobs += $batchJobs
+        }
         $pdfQueue.Clear()
     }
- 
+
+    Write-Host "Checking COM queue - count: $($comQueue.Count)"
     if ($comQueue.Count -gt 0) {
-        $jobs += Process-ComBatch `
-            -batch            $comQueue `
+        Write-Host "Calling PDF drain"
+        $batchJobs = Process-ComBatch `
+            -batch            $comQueueCopy `
             -metadataDuration $metadataDuration `
             -processedFiles   $processedFiles `
             -skippedFiles     $skippedFiles `
@@ -1270,12 +1292,19 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $comParallelItems
+        if($batchJobs -ne $null) {
+            $jobs += $batchJobs
+        }
+        Write-Host "COM drained"
         $comQueue.Clear()
     }
  
     # --- Wait for all jobs and collect output ---
+    Write-Host "Starting job wait loop - job count: $($jobs.Count)"
     foreach ($job in $jobs) {
-        $job.AsyncWaitHandle.WaitOne()
+        if($null -eq $job -or $null -eq $job.Pipe) { continue }
+        Write-Host "Waiting on job: $($job -eq $null)"
+        $job.Handle.AsyncWaitHandle.WaitOne()
         try {
             $output = $job.Pipe.EndInvoke($job.Handle)
             $output
@@ -1301,7 +1330,10 @@ function Process-PdfBatch{
             [string]$filePathLog,
             [int]$parallelItems
     )
-
+    if($batch -eq $null -or $batch.Count -eq 0) {
+        Write-Warning "Process-PdfBatch called with null or empty batch - returning early"
+        return @()
+    }    
     #Python dependencies for PDF updates
     $PythonPath = "C:\Program Files\Python313\python.exe"
     $ScriptPath = "C:\Temp\update_pdf_properties.py"
@@ -1659,6 +1691,10 @@ function Process-OpenXmlBatch {
         [string]$filePathLog,
         [int]$parallelItems
     )
+    if($batch -eq $null -or $batch.Count -eq 0) {
+        Write-Warning "Process-XmlBatch called with null or empty batch - returning early"
+        return @()
+    }    
  
     $pool = [runspacefactory]::CreateRunspacePool(1, $parallelItems)
     $pool.Open()
@@ -2316,6 +2352,10 @@ function Process-COMBatch {
         [string]$filePathLog,
         [int]$parallelItems
     )
+    if($batch -eq $null -or $batch.Count -eq 0) {
+        Write-Warning "Process-ComBatch called with null or empty batch - returning early"
+        return @()
+    }    
  
     $pool = [runspacefactory]::CreateRunspacePool(1, $parallelItems)
     $pool.Open()

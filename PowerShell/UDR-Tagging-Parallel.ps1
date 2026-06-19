@@ -1725,9 +1725,6 @@ function Process-COMBatch {
                         [System.GC]::WaitForPendingFinalizers() 
                     } 
                     catch {}
-                    $app = $null
-
-
                 }
  
                 if ($action -eq "ContinueFile") { continue }
@@ -1941,7 +1938,7 @@ function Execute_Tagging() {
 		Write-Host "Processing files with Update-FileAgeProperties ... "
 		# Execute the update process on retrieved files
 		try{
-            Update-FileAgeProperties -Files $filesToScanUnique -ProcessedFiles $scannedFiles
+            Update-FileAgeProperties -Files $filesToScanUnique -ProcessedFiles $scannedFiles -SkippedFiles $skippedFiles
         }
         catch {
             Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Update-FileAgeProperties failed without warning - $($_.Exception.Message)"

@@ -1114,7 +1114,7 @@ function Process-PdfBatch{
                     1 {$isPasswordProtected = $true}
                     2 {$isPasswordProtected = $true}
                     -1 {$isError = $true}
-                    0 {$process = $true}
+                    0 {$processed = $true}
                     default {
                         $isError = $true 
                         $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess - unexpected return code from Python: $result"

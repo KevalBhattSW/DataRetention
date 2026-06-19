@@ -3,7 +3,10 @@
     [string]$DrivePath
 )
 
-
+if(-not(Test-Path -LiteralPath $DrivePath -PathType Container)) {
+    Write-Error "DrivePath '$drivePath' does not exist or is not accessible. Aborting."
+    Exit 1
+}
 
 function Set-OfficeDocCustomProperty {
 	[OutputType([boolean])]
@@ -70,6 +73,7 @@ Function IsOfficeFilePasswordProtected([string]$officeFile) {
     
     return $hasPassword
 }
+
 
 
 function Handle-FileProcessingError {
@@ -185,7 +189,7 @@ function Handle-FileProcessingError {
         Write-Warning "Handle-FileProcessingError: unexpected failure preparing $File : $($_.Exception.Message)"
     }
  
-    # Logging — fixed param names to match Write-Log / Write-LogProcess definitions:
+    # Logging - fixed param names to match Write-Log / Write-LogProcess definitions:
     #   Write-Log expects -file, not -objFile
     #   Write-LogProcess expects -startTime as [string], so format the datetime here
     Write-Log -filePath $FilePath -file $File -message $message
@@ -620,7 +624,7 @@ function Set-OpenXmlProperties {
         Write-XmlToZipEntry -Entry $customEntry -Doc $customXml
 
         # ---------------------------------------------------------------
-        # 3. Patch [Content_Types].xml  — add Override for custom.xml
+        # 3. Patch [Content_Types].xml  - add Override for custom.xml
         # ---------------------------------------------------------------
         $ctSourceEntry = $sourceZip.GetEntry("[Content_Types].xml")
         if (-not $ctSourceEntry) {
@@ -652,7 +656,7 @@ function Set-OpenXmlProperties {
         Write-XmlToZipEntry -Entry $ctEntry -Doc $ctXml
 
         # ---------------------------------------------------------------
-        # 4. Patch _rels/.rels — add Relationship for custom.xml
+        # 4. Patch _rels/.rels - add Relationship for custom.xml
         # ---------------------------------------------------------------
         $relsSourceEntry = $sourceZip.GetEntry("_rels/.rels")
         if (-not $relsSourceEntry) {
@@ -1029,6 +1033,7 @@ function Wait-AndCollectJobs {
     return $collected
 }
  
+ 
 
 function Process-PdfBatch{
     param
@@ -1046,10 +1051,10 @@ function Process-PdfBatch{
         return @()
     }    
     #Python dependencies for PDF updates
-    $PythonPath = "C:\Program Files\Python313\python.exe"
-    $ScriptPath = "C:\Temp\update_pdf_properties.py"
-    #$PythonPath = "C:\Users\UDRTagging\AppData\Local\Programs\Python\Python313\python.exe"
+    #$PythonPath = "C:\Program Files\Python313\python.exe"
     #$ScriptPath = "C:\Temp\update_pdf_properties.py"
+    $PythonPath = "C:\Users\UDRTagging\AppData\Local\Python\pythoncore-3.14-64\python.exe"
+    $ScriptPath = "C:\Temp\update_pdf_properties_new.py"
 
 
     $pool = [runspacefactory]::CreateRunspacePool(1,$parallelItems)
@@ -1136,7 +1141,7 @@ function Process-PdfBatch{
                     $restoreMsg = $_.Exception.Message
                     $restoreHR = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
                     if ($restoreMsg -match 'being used by another process' -or $hresult -eq '80070020') {
-                        Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
+                        Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($restoreMsg)"
                         Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
                     } 
                     else {
@@ -1156,34 +1161,18 @@ function Process-PdfBatch{
                     Add-ContentSafe -Path $filePathLog -Value $logEntry
                 }
                 elseif ($isError) {
-                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess properties NOT updated - see error above"
+                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess properties NOT updated - $restoreMsg"
                     Add-ContentSafe -Path $filePathLog -Value $logEntry
                     Write-Output "$fileToProcess failed - see log"
 
-                    Write-Output "$fileToProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                 }
                 else {
-                    $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") - $fileToProcess properties NOT updated - see error above"
-                    Add-ContentSafe -Path $filePathLog -Value $logEntry
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess properties updated"
+                    Write-Output "$fileToProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 
-                    catch {
-                        $msg     = $_.Exception.Message
-                        $hresult = if ($_.Exception.HResult) { '{0:X8}' -f ($_.Exception.HResult) } else { $null }
-
-                        if ($msg -match 'being used by another process' -or $hresult -eq '80070020') {
-                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") $fileToProcess file currently open or locked, properties not set"
-                            Add-ContentSafe -Path $filePathLog -Value $logEntry
-                            Write-Warning "Timestamp restore skipped; file in use: $fileToProcess ($msg)"
-                            Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
-                        } 
-                        else {
-                            $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") ; $fileToProcess ; properties updated"
-                            Add-ContentSafe -Path $filePathLog -Value $logEntry                        
-                            Write-Output "$filetoProcess properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-                        }
-                    }                    
-                }
+                }                    
             }
+
         })  | Out-Null
         $ps.AddArgument($metadataDuration)| Out-Null
         $ps.AddArgument($processedFiles)| Out-Null
@@ -1202,8 +1191,13 @@ function Process-PdfBatch{
         }
     }
  
-    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
+    return [pscustomobject]@{
+        Jobs = $jobs
+        Pool = $pool
+    }
 }
+
+
 
 function Process-OpenXmlBatch {
     param(
@@ -1239,7 +1233,7 @@ function Process-OpenXmlBatch {
             $stream.Close()
         }
         catch {
-            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess locked before runspace — skipped"
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess locked before runspace - skipped"
             Add-ContentSafe -Path $skippedFiles -Value $fileToProcess
             continue
         }
@@ -1332,11 +1326,11 @@ function Process-OpenXmlBatch {
  
                 if ($isPasswordProtected) {
                     Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess file is password-protected"
-                    Write-Output "$fileToProcess skipped — password-protected"
+                    Write-Output "$fileToProcess skipped - password-protected"
                 }
                 elseif ($isError) {
-                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess properties NOT updated — see error above"
-                    Write-Output "$fileToProcess failed — see log"
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess properties NOT updated - see error above"
+                    Write-Output "$fileToProcess failed - see log"
                 }
                 else {
                     Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $fileToProcess properties updated"
@@ -1360,8 +1354,13 @@ function Process-OpenXmlBatch {
         }
     }
  
-    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
+    return [pscustomobject]@{
+        Jobs = $jobs
+        Pool = $pool
+    }
 }
+
+
 
 function Process-COMBatch {
     param(
@@ -1388,7 +1387,7 @@ function Process-COMBatch {
     $fnTestEncryptedPpt2003 = "function Test-Ppt2003HasOpenPassword { ${function:Test-Ppt2003HasOpenPassword} }"
     $fnAddContentSafe       = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
     $fnHandleError          = "function Handle-FileProcessingError { ${function:Handle-FileProcessingError} }"
-    # Write-Log and Write-LogProcess are called by Handle-FileProcessingError — must also be injected
+    # Write-Log and Write-LogProcess are called by Handle-FileProcessingError - must also be injected
     $fnWriteLog             = "function Write-Log { ${function:Write-Log} }"
     $fnWriteLogProcess      = "function Write-LogProcess { ${function:Write-LogProcess} }"
  
@@ -1439,11 +1438,11 @@ function Process-COMBatch {
             $dtCreated         = $item.CreationTime
             $dtLastModified    = $item.LastWriteTime
             $fileReadOnly      = $item.IsReadOnly
-            $startTime         = Get-Date
-            $startTimeF        = $startTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
             $filesize          = $item.Length
  
             try {
+                $startTime         = Get-Date
+                $startTimeF        = $startTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
                 switch -regex ($item.Extension) {
  
                     # ----------------------------------------------------------
@@ -1762,12 +1761,12 @@ function Process-COMBatch {
                 Add-ContentSafe -Path $processedFiles   -Value $file
  
                 if ($isPasswordProtected) {
-                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file skipped — password-protected"
-                    Write-Output "$file skipped — password-protected"
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file skipped - password-protected"
+                    Write-Output "$file skipped - password-protected"
                 }
                 elseif ($isError) {
-                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties NOT updated — see error above"
-                    Write-Output "$file failed — see log"
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties NOT updated - see error above"
+                    Write-Output "$file failed - see log"
                 }
                 elseif ($processed) {
                     Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties updated"
@@ -1783,7 +1782,7 @@ function Process-COMBatch {
         $ps.AddArgument($filepathProgress)  | Out-Null
         $ps.AddArgument($format)            | Out-Null
         $ps.AddArgument($filePathLog)       | Out-Null
-        $ps.AddArgument($filePath)          | Out-Null   # the actual file — was $fileToProcess (undefined)
+        $ps.AddArgument($filePath)          | Out-Null   # the actual file - was $fileToProcess (undefined)
  
         $jobs += [pscustomobject]@{
             Pipe   = $ps
@@ -1791,7 +1790,10 @@ function Process-COMBatch {
         }
     }
  
-    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
+    return [pscustomobject]@{
+        Jobs = $jobs
+        Pool = $pool
+    }
 }
 
 function Get-ApplicableFiles {
@@ -1825,8 +1827,8 @@ function Get-ApplicableFiles {
         # Process files in current folder
         Get-ChildItem -LiteralPath $FolderName -File -ErrorAction Stop |
         Where-Object {
-            #$_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
-            #$_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
+            $_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
+            $_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
             ($officeExtensions -contains $_.Extension.ToLowerInvariant()) -and
             $_.Name.Substring(0,1) -ne '~' -and
             $_.Length -gt 0
@@ -1868,10 +1870,10 @@ function Execute_Tagging() {
 	$FolderName = $DrivePath
 	Write-Host "Folder Name is: $FolderName"
 	# $FolderName = "C:\temp\Labelling"
-    $targetFolder = ($($FolderName.TrimStart('\').Replace('\','_'))).Replace('C:','_')
+    #$targetFolder = ($($FolderName.TrimStart('\').Replace('\','_'))).Replace('C:','_')
 	# Define the file collection location
-	#$targetDir = "C:\Temp\Unstructured\$($FolderName.TrimStart('\').Replace('\','_'))"
-    $targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\$targetFolder"
+	$targetDir = "C:\Temp\Unstructured\$($FolderName.TrimStart('\').Replace('\','_'))"
+    #$targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\$targetFolder"
 	if (!(Test-Path $targetDir -PathType Container)) {
 		New-Item -ItemType Directory -Path $targetDir
 		$newRun = $true
@@ -1938,7 +1940,14 @@ function Execute_Tagging() {
 	if ($continue -eq $true) {
 		Write-Host "Processing files with Update-FileAgeProperties ... "
 		# Execute the update process on retrieved files
-		Update-FileAgeProperties -Files $filesToScanUnique -ProcessedFiles $scannedFiles
+		try{
+            Update-FileAgeProperties -Files $filesToScanUnique -ProcessedFiles $scannedFiles
+        }
+        catch {
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Update-FileAgeProperties failed without warning - $($_.Exception.Message)"
+            Write-Output "Update-FileAgeProperties failed without warning - $($_.Exception.Message)"
+        }
+            
 		$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 		$filenameToScan = "$($timestamp)_FilesToScan.txt"
 		$filenameScanned = "$($timestamp)_FilesScanned.txt"
@@ -2059,8 +2068,13 @@ function Stop-KillProcessMonitor {
 function Invoke-ExecuteTaggingSafely {
 
     # Start the external monitor process (hidden)
-    #$monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "C:\temp\KillProcess.log" -ShowWindow -NoExit
-    $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$($env:LOCALAPPDATA)\Temp\KillProcess.log" -ShowWindow -NoExit
+    $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "C:\temp\KillProcess.log" -ShowWindow -NoExit
+    #$monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$($env:LOCALAPPDATA)\Temp\KillProcess.log" -ShowWindow -NoExit
+
+    if ($null -eq $monitorProc) {
+        Write-Error "Process kill monitor failed to start"
+        Exit 1
+    }
 
     $taggingFailed = $false
 
@@ -2102,13 +2116,13 @@ function Invoke-ExecuteTaggingSafely {
                     break
                 }
 
-                Write-Host "Still running: $($remaining -join ', ') — waiting..."
+                Write-Host "Still running: $($remaining -join ', ') - waiting..."
                 Start-Sleep -Milliseconds $pollIntervalMs
                 $elapsed += $pollIntervalMs
             }
 
             if ($elapsed -ge ($drainTimeoutSecs * 1000)) {
-                Write-Warning "Drain timeout reached ($drainTimeoutSecs s) — Office processes may still be running. Stopping monitor anyway."
+                Write-Warning "Drain timeout reached ($drainTimeoutSecs s) - Office processes may still be running. Stopping monitor anyway."
             }
 
             Stop-KillProcessMonitor -MonitorProcess $monitorProc

@@ -927,256 +927,98 @@ function Add-ContentSafe {
 }
 
 #Function to loop through a collection of files, check their age and create/update custom document properties
-<#
 function Update-FileAgeProperties {
-    param ([System.Collections.ArrayList]$Files,
-            [String] $processedFiles) #pass in an existing collection object and list of processed files
+    param (
+        [System.Collections.ArrayList]$Files,
+        [string]$processedFiles,
+        [string]$skippedFiles,
+        [int]$openXmlParallelItems = 3,
+        [int]$pdfParallelItems     = 3,
+        [int]$comParallelItems     = 2,
+
+        # Batch trigger thresholds — how many files accumulate in a queue
+        # before that queue is dispatched as a batch. This is NOT a
+        # concurrency control; the *ParallelItems values above still cap
+        # how many runspaces execute simultaneously within a batch via
+        # CreateRunspacePool(1, $parallelItems). Raising these thresholds
+        # just means fewer, larger dispatch/drain cycles — less pool
+        # open/close overhead — while parallelItems continues to throttle
+        # how many files are actually being worked on at once.
+        [int]$openXmlBatchTrigger = 30,   # was 3
+        [int]$pdfBatchTrigger     = 30,   # was 3
+        [int]$comBatchTrigger     = 20    # was 2
+    )
 
     if (!(Test-FileExists -fileToTest $processedFiles)) {
         return
     }
 
     $debugFile = "$($env:LOCALAPPDATA)\temp\debug.txt"
-
-    if (!(Test-FileExists -fileToTest $debugFile)) {
-        New-Item -Path $debugFile -ItemType File -Force
+    if (!(Test-Path -Path $debugFile -PathType Leaf)) {
+        New-Item -Path $debugFile -ItemType File -Force | Out-Null
     }
 
-    
-
     $Propertylogfolderpath = "$targetDir\PropertyUpdateLogs"
-	if (! (Test-Path $Propertylogfolderpath -PathType Container)) {
-		New-Item -Path $Propertylogfolderpath -ItemType Directory -Force
-	}
+    if (!(Test-Path $Propertylogfolderpath -PathType Container)) {
+        New-Item -Path $Propertylogfolderpath -ItemType Directory -Force | Out-Null
+    }
 
     $Propertystatusfolderpath = "$targetDir\PropertyUpdateStatus"
-	if (! (Test-Path $Propertystatusfolderpath -PathType Container)) {
-		New-Item -Path $Propertystatusfolderpath -ItemType Directory -Force
-	}
-
+    if (!(Test-Path $Propertystatusfolderpath -PathType Container)) {
+        New-Item -Path $Propertystatusfolderpath -ItemType Directory -Force | Out-Null
+    }
 
     $comQueue     = New-Object System.Collections.ArrayList
     $openXmlQueue = New-Object System.Collections.ArrayList
     $pdfQueue     = New-Object System.Collections.ArrayList
 
-    $jobs = @()
-    # Define output log file
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $filename = "$($timestamp)_AddPropertiesLog.txt"
-    $filenameProgress = "$($timestamp)_AddPropertiesStatus.txt"
-    $filepath = "$Propertylogfolderpath\$filename"
-    $scannedFiles = "$targetDir\FilesScanned.txt"
-    $filepathProgress = "$Propertystatusfolderpath\$filenameProgress"
+    # NOTE: $jobs is gone entirely — nothing accumulates across the run any more.
+    # Each batch is dispatched and drained (waited on, disposed, pool closed)
+    # immediately, in-line, before the foreach loop moves to the next file.
+
+    $timestamp        = Get-Date -Format "yyyyMMdd_HHmmss"
+    $filepath         = "$Propertylogfolderpath\$($timestamp)_AddPropertiesLog.txt"
+    $filepathProgress = "$Propertystatusfolderpath\$($timestamp)_AddPropertiesStatus.txt"
     $metadataDuration = 100
 
-    $logEntryProgress = @("Filename", "StartTime", "EndTime", "Format", "Filesize", "PasswordProtected") -Join "|"
+    $logEntryProgress = @("Filename","StartTime","EndTime","Format","Filesize","PasswordProtected") -Join "|"
     Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
 
-    # Create the log file
-    New-Item -Path $filepath -ItemType File -Force
+    New-Item -Path $filepath -ItemType File -Force | Out-Null
 
-    # Loop through each file in collection parameter
+    $batchCounter = 0
+
     foreach ($file in $Files) {
-        $status = $null
 
         if ($file -like "*Incentives Newsletter!*.doc") {
             Write-Output "$file so skipped due to constant (Exception from HRESULT: 0x800706BE) error"
             continue
         }
 
-        write-Output $file
-
-        if (!(Test-FileExists -fileToTest $file)) {
-
-            Add-ContentSafe -Path $ProcessedFiles -Value $file
-            $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file not found"
-    		Add-ContentSafe -Path $filepath -Value $logEntry
-    		Write-Output "$file file locked/open so skipped"
-
-            continue
-            }
-
-        if ((Test-FileLocked -fileToTest $file)) {
-    		$logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file locked/open so skipped"
-    		Add-ContentSafe -Path $filepath -Value $logEntry
-    		Write-Output "$file file locked/open so skipped"
-
-    		Add-ContentSafe -Path $skippedFiles -Value $file
-    		continue
-            }
-
-        $processed = $false
-        $success = $false
-
-        $item = Get-Item -LiteralPath $file
-
-        # Get file time metadata
-        $dtLastAccessedDoc = $item.LastAccessTime
-        $dtCreated = $item.CreationTime
-        $dtLastModified = $item.LastWriteTime
-
-
-        
-        if ($item.Extension -eq ".pdf") {
-            $pdfQueue.Add($file) > $null
-        }
-        else {
-            $format = (Get-OfficeFormat $file).Format
-            Write-Output "$objFile -> $format"
-            if ($format -eq "OpenXML") {
-                $openXmlQueue.Add($file) > $null
-            }
-            elseif ($format -eq "BinaryOLE") {
-                $comQueue.Add($file) > $null
-            }
-        }
-
-        # Write to the log
-        $logEntry = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss") $file preparing file for property update"
-        Add-ContentSafe -Path $filepath -Value $logEntry
-
-        # --- Batch trigger
-        if ($openXmlQueue.Count -ge 3) {
-            $openXmlQueueCopy = @($openXmlQueue)    
-            $jobs += Process-openXmlBatch `
-                -batch $openXmlQueueCopy `
-                -metadataDuration $metadataDuration `
-                -processedFiles $processedFiles `
-                -skippedFiles $skippedFiles `
-                -filepathProgress $filepathProgress
-                -format $format
-            $openXmlQueue.Clear()
-        }
-
-        if ($pdfQueue.Count -ge 3) {
-            $pdfQueueCopy = @($pdfQueue)    
-            #$jobs += Process-PdfBatch `
-            #    -batch $pdfQueueCopy `
-            #    -metadataDuration $metadataDuration `
-            #    -processedFiles $processedFiles `
-            #    -skippedFiles $skippedFiles `
-            #    -filepathProgress $filepathProgress
-            #    -format $format
-            $pdfQueue.Clear()
-        }
-
-        if ($comQueue.Count -ge 2) {   # much smaller batch for COM
-            $jobs += Process-ComBatch $comQueue
-            $comQueue.Clear()
-        }
-    }
-
-    if ($openXmlQueue.Count -gt 0) { $jobs += Process-OpenXmlBatch $openXmlQueue }
-    if ($pdfQueue.Count -gt 0) {
-        $pdfQueueCopy = @($pdfQueue)    
-        #$jobs += Process-PdfBatch `
-        #    -batch $pdfQueueCopy `
-        #    -metadataDuration $metadataDuration `
-        #    -processedFiles $processedFiles `
-        #    -skippedFiles $skippedFiles `
-        #    -filepathProgress $filepathProgress
-        #    -format $format `
-        #    -filepath $filepath
-        $pdfQueue.Clear()
-        }
-    if ($comQueue.Count -gt 0)     { $jobs += Process-ComBatch $comQueue }
-
-    # Wait for completion
-    foreach ($job in $jobs) {
-        $job.AsyncWaitHandle.WaitOne()
-
-        try {
-            $output = $job.Pipe.EndInvoke($job.Handle)
-            $output
-        }
-        catch {
-            Write-Host "RUNSPACE ERROR: $($_.Exception.Message)"
-        }
-
-        $job.Pipe.Dispose()
-        $ps.EndInvoke($job)
-        $ps.Dispose()
-        }   
-
-}
-#>
-function Update-FileAgeProperties {
-    param (
-        [System.Collections.ArrayList]$Files,
-        [string]$processedFiles,
-        [string]$skippedFiles      # added — was referenced but never received
-    )
- 
-    if (!(Test-FileExists -fileToTest $processedFiles)) {
-        return
-    }
- 
-    $debugFile = "$($env:LOCALAPPDATA)\temp\debug.txt"
-    if (!(Test-Path -Path $debugFile -PathType Leaf)) {
-        New-Item -Path $debugFile -ItemType File -Force | Out-Null
-    }
- 
-    $Propertylogfolderpath = "$targetDir\PropertyUpdateLogs"
-    if (!(Test-Path $Propertylogfolderpath -PathType Container)) {
-        New-Item -Path $Propertylogfolderpath -ItemType Directory -Force | Out-Null
-    }
- 
-    $Propertystatusfolderpath = "$targetDir\PropertyUpdateStatus"
-    if (!(Test-Path $Propertystatusfolderpath -PathType Container)) {
-        New-Item -Path $Propertystatusfolderpath -ItemType Directory -Force | Out-Null
-    }
-    
-    $comParallelItems = 3
-    $openXmlParallelItems = 8
-    $pdfParallelItems = 8
-
-    $comQueue     = New-Object System.Collections.ArrayList
-    $openXmlQueue = New-Object System.Collections.ArrayList
-    $pdfQueue     = New-Object System.Collections.ArrayList
- 
-    $jobs = @()
- 
-    $timestamp        = Get-Date -Format "yyyyMMdd_HHmmss"
-    $filepath         = "$Propertylogfolderpath\$($timestamp)_AddPropertiesLog.txt"
-    $filepathProgress = "$Propertystatusfolderpath\$($timestamp)_AddPropertiesStatus.txt"
-    $metadataDuration = 100
- 
-    $logEntryProgress = @("Filename","StartTime","EndTime","Format","Filesize","PasswordProtected") -Join "|"
-    Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
- 
-    New-Item -Path $filepath -ItemType File -Force | Out-Null
- 
-    foreach ($file in $Files) {
- 
-        if ($file -like "*Incentives Newsletter!*.doc") {
-            Write-Output "$file - skipped due to constant (Exception from HRESULT: 0x800706BE) error"
-            continue
-        }
- 
         Write-Output $file
- 
+
         if (!(Test-FileExists -fileToTest $file)) {
             Add-ContentSafe -Path $processedFiles -Value $file
             Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file not found"
-            Write-Output "$file file not found - skipped"
+            Write-Output "$file file not found so skipped"
             continue
         }
- 
+
         if (Test-FileLocked -fileToTest $file) {
             Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file locked/open so skipped"
-            Write-Output "$file file locked/open - skipped"
+            Write-Output "$file file locked/open so skipped"
             Add-ContentSafe -Path $skippedFiles -Value $file
             continue
         }
- 
+
         $item = Get-Item -LiteralPath $file
- 
+
         if ($item.Extension -eq ".pdf") {
             $pdfQueue.Add($file) | Out-Null
         }
         else {
             $format = (Get-OfficeFormat $file).Format
-            #Write-Output "$file -> $format"
+            Write-Output "$file -> $format"
             if ($format -eq "OpenXML") {
                 $openXmlQueue.Add($file) | Out-Null
             }
@@ -1184,13 +1026,14 @@ function Update-FileAgeProperties {
                 $comQueue.Add($file) | Out-Null
             }
         }
- 
+
         Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file queued for property update"
- 
-        # --- Batch triggers ---
-        if ($openXmlQueue.Count -ge $openXmlParallelItems) {
+
+        # --- Batch triggers: dispatch, wait, dispose, close pool — all before continuing ---
+
+        if ($openXmlQueue.Count -ge $openXmlBatchTrigger) {
             $openXmlQueueCopy = [System.Collections.ArrayList]@($openXmlQueue)
-            $batchJobs = Process-OpenXmlBatch `
+            $batchResult = Process-OpenXmlBatch `
                 -batch            $openXmlQueueCopy `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
@@ -1199,16 +1042,15 @@ function Update-FileAgeProperties {
                 -format           $format `
                 -filePathLog      $filepath `
                 -parallelItems    $openXmlParallelItems
-            if($batchJobs -ne $null) {
-                $jobs += $batchJobs
-            }
+
+            Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
             $openXmlQueue.Clear()
+            $batchCounter++
         }
- 
-        if ($pdfQueue.Count -ge $pdfParallelItems) {
-            # PDF batch processing placeholder
+
+        if ($pdfQueue.Count -ge $pdfBatchTrigger) {
             $pdfQueueCopy = [System.Collections.ArrayList]@($pdfQueue)
-            $batchJobs = Process-PdfBatch `
+            $batchResult = Process-PdfBatch `
                 -batch            $pdfQueueCopy `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
@@ -1217,37 +1059,44 @@ function Update-FileAgeProperties {
                 -format           $format `
                 -filePathLog      $filepath `
                 -parallelItems    $pdfParallelItems
-            if($batchJobs -ne $null) {
-                $jobs += $batchJobs
-            }
+
+            Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
             $pdfQueue.Clear()
+            $batchCounter++
         }
- 
-        if ($comQueue.Count -ge $comParallelItems) {
+
+        if ($comQueue.Count -ge $comBatchTrigger) {
             $comQueueCopy = [System.Collections.ArrayList]@($comQueue)
-            $batchJobs = Process-ComBatch `
+            $batchResult = Process-ComBatch `
                 -batch            $comQueueCopy `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
                 -skippedFiles     $skippedFiles `
                 -filepathProgress $filepathProgress `
-                -format           $format `
                 -filePathLog      $filepath `
                 -parallelItems    $comParallelItems
-            if($batchJobs -ne $null) {
-                $jobs += $batchJobs
-            }
+
+            Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
             $comQueue.Clear()
+            $batchCounter++
+        }
+
+        # --- Periodic GC nudge every 20 batches ---
+        # Not done per-file (too costly); done at a batch-count interval so COM
+        # and runspace-related memory gets reclaimed promptly across a long run
+        # without constantly interrupting throughput.
+        if ($batchCounter -gt 0 -and ($batchCounter % 20) -eq 0) {
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            $batchCounter = 0   # reset so the modulus check doesn't refire every iteration once past a multiple of 20
         }
     }
-    Write-Host "Queue drain commencing"
 
-    # --- Drain remaining queues ---
-    Write-Host "Checking openXml queue - count: $($openXmlQueue.Count)"
+    # --- Drain any remaining partial batches ---
+
     if ($openXmlQueue.Count -gt 0) {
-        Write-Host "Calling XML drain"
-        $batchJobs = Process-OpenXmlBatch `
-            -batch            $openXmlQueueCopy `
+        $batchResult = Process-OpenXmlBatch `
+            -batch            $openXmlQueue `
             -metadataDuration $metadataDuration `
             -processedFiles   $processedFiles `
             -skippedFiles     $skippedFiles `
@@ -1255,18 +1104,13 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $openXmlParallelItems
-        if($batchJobs -ne $null) {
-            $jobs += $batchJobs
-        }
-        Write-Host "XML drained"
-        $openXmlQueue.Clear()
+
+        Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
     }
- 
-    Write-Host "Checking PDF queue - count: $($pdfQueue.Count)"
+
     if ($pdfQueue.Count -gt 0) {
-        Write-Host "Calling PDF drain"
-        $batchJobs = Process-PdfBatch `
-            -batch            $pdfQueueCopy `
+        $batchResult = Process-PdfBatch `
+            -batch            $pdfQueue `
             -metadataDuration $metadataDuration `
             -processedFiles   $processedFiles `
             -skippedFiles     $skippedFiles `
@@ -1274,40 +1118,51 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $pdfParallelItems
-        if($batchJobs -ne $null) {
-            $jobs += $batchJobs
-        }
-        $pdfQueue.Clear()
+
+        Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
     }
 
-    Write-Host "Checking COM queue - count: $($comQueue.Count)"
     if ($comQueue.Count -gt 0) {
-        Write-Host "Calling PDF drain"
-        $batchJobs = Process-ComBatch `
-            -batch            $comQueueCopy `
+        $batchResult = Process-ComBatch `
+            -batch            $comQueue `
             -metadataDuration $metadataDuration `
             -processedFiles   $processedFiles `
             -skippedFiles     $skippedFiles `
             -filepathProgress $filepathProgress `
-            -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $comParallelItems
-        if($batchJobs -ne $null) {
-            $jobs += $batchJobs
-        }
-        Write-Host "COM drained"
-        $comQueue.Clear()
+
+        Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
     }
- 
-    # --- Wait for all jobs and collect output ---
-    Write-Host "Starting job wait loop - job count: $($jobs.Count)"
-    foreach ($job in $jobs) {
-        if($null -eq $job -or $null -eq $job.Pipe) { continue }
-        Write-Host "Waiting on job: $($job -eq $null)"
+
+    # Final GC pass at the very end of the run
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
+
+
+# ---------------------------------------------------------------------------
+# Wait-AndCollectJobs
+# Shared helper — waits on every job in a batch result, collects output,
+# disposes each Pipe, then closes and disposes the runspace pool itself.
+# This is what makes the incremental draining above actually free memory:
+# without explicitly closing $BatchResult.Pool, the pool's threads and
+# buffers stay allocated even after every job in it has completed.
+# ---------------------------------------------------------------------------
+function Wait-AndCollectJobs {
+    param($BatchResult)
+
+    $collected = @()
+
+    if ($null -eq $BatchResult) { return $collected }
+
+    foreach ($job in $BatchResult.Jobs) {
+        if ($null -eq $job -or $null -eq $job.Pipe -or $null -eq $job.Handle) { continue }
+
         $job.Handle.AsyncWaitHandle.WaitOne()
         try {
             $output = $job.Pipe.EndInvoke($job.Handle)
-            $output
+            if ($output) { $collected += $output }
         }
         catch {
             Write-Warning "Runspace error: $($_.Exception.Message)"
@@ -1316,6 +1171,13 @@ function Update-FileAgeProperties {
             $job.Pipe.Dispose()
         }
     }
+
+    if ($BatchResult.Pool) {
+        $BatchResult.Pool.Close()
+        $BatchResult.Pool.Dispose()
+    }
+
+    return $collected
 }
  
 
@@ -1491,7 +1353,7 @@ function Process-PdfBatch{
         }
     }
  
-    return $jobs
+    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
 }
 
 <#
@@ -1835,7 +1697,7 @@ function Process-OpenXmlBatch {
         }
     }
  
-    return $jobs
+    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
 }
 
 <#
@@ -2769,7 +2631,7 @@ function Process-COMBatch {
         }
     }
  
-    return $jobs
+    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
 }
 
 function Get-ApplicableFiles {

@@ -44,28 +44,28 @@ param(
 $ErrorActionPreference = "Stop"
 Add-Type @"
 using System;
-using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.IO;
 
-public class CsvDataReader : IDataReader
+public class CsvDataReader : DbDataReader
 {
-    private readonly StreamReader  _reader;
-    private readonly char          _delimiter;
-    private readonly string        _sourceFile;
-    private readonly DateTime      _loadDt;
-    private readonly string[]      _headers;
-    private string[]               _current;
-    private bool                   _closed;
+    private readonly StreamReader _reader;
+    private readonly char         _delimiter;
+    private readonly string       _sourceFile;
+    private readonly DateTime     _loadDt;
+    private readonly string[]     _headers;
+    private string[]              _current;
+    private bool                  _closed;
 
     private int DataColCount  { get { return _headers.Length; } }
-    private int TotalColCount { get { return _headers.Length + 2; } }
+    public  int RowCount      { get; private set; }
 
     public CsvDataReader(string filePath, char delimiter)
     {
         _reader     = new StreamReader(filePath, System.Text.Encoding.UTF8, true);
         _delimiter  = delimiter;
-        _sourceFile = Path.GetFileName(filePath);
+        _sourceFile = System.IO.Path.GetFileName(filePath);
         _loadDt     = DateTime.UtcNow;
 
         var headerLine = _reader.ReadLine();
@@ -74,9 +74,12 @@ public class CsvDataReader : IDataReader
             : headerLine.Split(_delimiter);
     }
 
-    public int RowCount { get; private set; }
+    public override int FieldCount
+    {
+        get { return _headers.Length + 2; }
+    }
 
-    public bool Read()
+    public override bool Read()
     {
         if (_closed) return false;
         var line = _reader.ReadLine();
@@ -86,9 +89,7 @@ public class CsvDataReader : IDataReader
         return true;
     }
 
-    public int FieldCount { get { return TotalColCount; } }
-
-    public object GetValue(int i)
+    public override object GetValue(int i)
     {
         if (i < DataColCount)
         {
@@ -101,7 +102,7 @@ public class CsvDataReader : IDataReader
         throw new IndexOutOfRangeException();
     }
 
-    public string GetName(int i)
+    public override string GetName(int i)
     {
         if (i < DataColCount)      return _headers[i];
         if (i == DataColCount)     return "SourceFile";
@@ -109,7 +110,7 @@ public class CsvDataReader : IDataReader
         throw new IndexOutOfRangeException();
     }
 
-    public int GetOrdinal(string name)
+    public override int GetOrdinal(string name)
     {
         for (int i = 0; i < _headers.Length; i++)
             if (string.Equals(_headers[i], name, StringComparison.OrdinalIgnoreCase)) return i;
@@ -118,44 +119,52 @@ public class CsvDataReader : IDataReader
         throw new IndexOutOfRangeException(name);
     }
 
-    public void Close()               { _closed = true; _reader.Dispose(); }
-    public void Dispose()             { Close(); }
-    public int  Depth                 { get { return 0; } }
-    public bool IsClosed              { get { return _closed; } }
-    public int  RecordsAffected       { get { return -1; } }
-    public bool NextResult()          { return false; }
-    public DataTable GetSchemaTable() { return null; }
-
-    public bool     GetBoolean(int i)  { return Convert.ToBoolean(GetValue(i)); }
-    public byte     GetByte(int i)     { return Convert.ToByte(GetValue(i)); }
-    public long     GetBytes(int i, long fo, byte[] buf, int bo, int len) { return 0; }
-    public char     GetChar(int i)     { return Convert.ToChar(GetValue(i)); }
-    public long     GetChars(int i, long fo, char[] buf, int bo, int len) { return 0; }
-    public Guid     GetGuid(int i)     { return Guid.Parse(GetValue(i).ToString()); }
-    public short    GetInt16(int i)    { return Convert.ToInt16(GetValue(i)); }
-    public int      GetInt32(int i)    { return Convert.ToInt32(GetValue(i)); }
-    public long     GetInt64(int i)    { return Convert.ToInt64(GetValue(i)); }
-    public float    GetFloat(int i)    { return Convert.ToSingle(GetValue(i)); }
-    public double   GetDouble(int i)   { return Convert.ToDouble(GetValue(i)); }
-    public decimal  GetDecimal(int i)  { return Convert.ToDecimal(GetValue(i)); }
-    public DateTime GetDateTime(int i) { return Convert.ToDateTime(GetValue(i)); }
-    public string   GetString(int i)   { return GetValue(i) == null ? null : GetValue(i).ToString(); }
-    public string   GetDataTypeName(int i) { return "nvarchar"; }
-    public Type     GetFieldType(int i)    { return typeof(string); }
-
-    public int GetValues(object[] values)
+    public override bool IsDBNull(int i)
     {
-        int n = Math.Min(values.Length, TotalColCount);
+        return GetValue(i) == DBNull.Value;
+    }
+
+    public override int GetValues(object[] values)
+    {
+        int n = Math.Min(values.Length, FieldCount);
         for (int i = 0; i < n; i++) values[i] = GetValue(i);
         return n;
     }
 
-    public bool IsDBNull(int i) { return GetValue(i) == DBNull.Value; }
+    public override void Close()         { _closed = true; _reader.Dispose(); }
+    public override bool IsClosed        { get { return _closed; } }
+    public override int  Depth           { get { return 0; } }
+    public override int  RecordsAffected { get { return -1; } }
+    public override bool HasRows         { get { return true; } }
+    public override bool NextResult()    { return false; }
 
-    public object this[int i]    { get { return GetValue(i); } }
-    public object this[string n] { get { return GetValue(GetOrdinal(n)); } }
+    public override bool    GetBoolean(int i)  { return Convert.ToBoolean(GetValue(i)); }
+    public override byte    GetByte(int i)     { return Convert.ToByte(GetValue(i)); }
+    public override char    GetChar(int i)     { return Convert.ToChar(GetValue(i)); }
+    public override Guid    GetGuid(int i)     { return Guid.Parse(GetValue(i).ToString()); }
+    public override short   GetInt16(int i)    { return Convert.ToInt16(GetValue(i)); }
+    public override int     GetInt32(int i)    { return Convert.ToInt32(GetValue(i)); }
+    public override long    GetInt64(int i)    { return Convert.ToInt64(GetValue(i)); }
+    public override float   GetFloat(int i)    { return Convert.ToSingle(GetValue(i)); }
+    public override double  GetDouble(int i)   { return Convert.ToDouble(GetValue(i)); }
+    public override decimal GetDecimal(int i)  { return Convert.ToDecimal(GetValue(i)); }
+    public override DateTime GetDateTime(int i){ return Convert.ToDateTime(GetValue(i)); }
+    public override string  GetString(int i)   { return IsDBNull(i) ? null : GetValue(i).ToString(); }
+    public override string  GetDataTypeName(int i) { return "nvarchar"; }
+    public override Type    GetFieldType(int i)    { return typeof(string); }
+
+    public override long GetBytes(int i, long fo, byte[] buf, int bo, int len) { return 0; }
+    public override long GetChars(int i, long fo, char[] buf, int bo, int len) { return 0; }
+
+    public override System.Collections.IEnumerator GetEnumerator()
+    {
+        return new DbEnumerator(this, true);
+    }
+
+    public override object this[int i]    { get { return GetValue(i); } }
+    public override object this[string n] { get { return GetValue(GetOrdinal(n)); } }
 }
-"@ -ReferencedAssemblies "System.Data"
+"@ -ReferencedAssemblies "System.Data", "System.Xml"
 # ------------------------------------------------------------------
 # 0. Setup
 # ------------------------------------------------------------------

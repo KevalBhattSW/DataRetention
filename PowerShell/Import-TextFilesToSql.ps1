@@ -292,6 +292,12 @@ foreach ($f in $plainFiles) {
         $bulkCopy.BatchSize            = $BatchSize
         $bulkCopy.BulkCopyTimeout      = 0
 
+
+        # Explicit mappings: file column name -> staging table column name.
+        @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked","SourceFile","LoadDateTime") | ForEach-Object {
+            $bulkCopy.ColumnMappings.Add($_, $_) | Out-Null
+        }
+
         $bulkCopy.WriteToServer($csvReader)
         $bulkCopy.Close()
         $csvReader.Close()

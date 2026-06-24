@@ -35,8 +35,15 @@ if (-not (Test-Path -Path $WorkingPath -PathType Container)) {
     New-Item -Path $WorkingPath -ItemType Directory -Force | Out-Null
 }
 
-$destinationPath = $WorkingPath
-$timestamp       = Get-Date -Format "yyyyMMdd_HHmmss"
+# Output listing goes in a 'servers' subfolder — fixed name per drive, no datestamp,
+# so the same file is appended to on resume. Progress log is datestamped at the root
+# so each run (including resumes) gets its own clean log.
+$serversPath = Join-Path -Path $WorkingPath -ChildPath "servers"
+if (-not (Test-Path -Path $serversPath -PathType Container)) {
+    New-Item -Path $serversPath -ItemType Directory -Force | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +213,10 @@ function Wait-AndCollectJobs {
         $job.Handle.AsyncWaitHandle.WaitOne()
         try {
             $output = $job.Pipe.EndInvoke($job.Handle)
-            if ($output) { $collected.AddRange([object[]]$output) }
+            if ($output) {
+                $valid = [object[]]($output | Where-Object { $_ -ne $null })
+                if ($valid.Count -gt 0) { $collected.AddRange($valid) }
+            }
         }
         catch {
             Write-Warning "Runspace error: $($_.Exception.Message)"
@@ -255,6 +265,7 @@ function Invoke-FlushBatch {
     $rows = Wait-AndCollectJobs -BatchResult $batchResult
 
     foreach ($row in $rows) {
+        if ($null -eq $row -or -not $row.Name -or -not $row.ContainingPath) { continue }
         $listEntry = @(
             $row.Name, $row.ContainingPath, $row.Size, $row.LastModified,
             $row.LastAccessed, $row.CreationDate, $row.Extension,
@@ -344,22 +355,96 @@ function Walk-AndProcess {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-$filename     = ($DrivePath.Replace('\','_').Replace(':',''))
-$filePath     = "$destinationPath$($timestamp)_$($filename)_DriveListing.txt"
-$progressFile = "$destinationPath$($timestamp)_DriveListingProgress.txt"
+$filenameStem = $DrivePath.Replace('\','_').Replace(':','').TrimStart('_')
+$filePath     = Join-Path -Path $serversPath -ChildPath "$($filenameStem)_DriveListing.txt"
+$progressFile = Join-Path -Path $WorkingPath -ChildPath "$($timestamp)_DriveListingProgress.txt"
 
 New-Item -Path $progressFile -ItemType File -Force | Out-Null
 
-# Create output file with header immediately
-New-Item -Path $filePath -ItemType File -Force | Out-Null
-$header = @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked") -Join [char]9
-Add-Content -Path $filePath -Value $header
+# ---------------------------------------------------------------------------
+# Resume detection — prompt if a listing file already exists for this drive
+# ---------------------------------------------------------------------------
+$isResume = $false
+$seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+if (Test-Path -LiteralPath $filePath -PathType Leaf) {
+
+    Write-Host ""
+    Write-Host "An existing listing file was found for this drive:" -ForegroundColor Yellow
+    Write-Host "  $filePath" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  [R] Resume  — continue from where the previous run stopped, appending to this file"
+    Write-Host "  [O] Overwrite — delete the existing file and start fresh"
+    Write-Host "  [X] Exit    — abort this run"
+    Write-Host ""
+
+    do {
+        $choice = Read-Host "Enter choice (R / O / X)"
+    } while ($choice -notmatch '^[ROXrox]$')
+
+    switch ($choice.ToUpper()) {
+
+        'R' {
+            $isResume = $true
+            Write-Host "Resuming. Loading already-processed paths from existing listing..." -ForegroundColor Cyan
+            Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') RESUME run started for $DrivePath — loading existing listing from $filePath"
+
+            # Read every non-header data row and reconstruct the full path
+            # from columns: Name (col 0) and ContainingPath (col 1).
+            # The ContainingPath stored may be a mapped UNC path, so we also
+            # need to reverse-map it back to the local drive letter if applicable,
+            # to match what Get-ChildItem will hand us during the walk.
+            $rowCount = 0
+            Get-Content -LiteralPath $filePath |
+                Select-Object -Skip 1 |   # skip header row
+                ForEach-Object {
+                    $cols = $_ -split [char]9
+                    if ($cols.Count -ge 2 -and $cols[0] -and $cols[1]) {
+                        $storedPath = Join-Path -Path $cols[1] -ChildPath $cols[0]
+
+                        # If a drive-letter mapping is active, reverse the UNC back
+                        # to the local path so the HashSet matches what the walk sees
+                        if ($DriveLetter -and $MappedPath -and $storedPath.StartsWith($MappedPath)) {
+                            $relative   = $storedPath.Substring($MappedPath.Length).TrimStart('\')
+                            $storedPath = "$DriveLetter`:\$relative"
+                        }
+
+                        $seenPaths.Add($storedPath) | Out-Null
+                        $rowCount++
+                    }
+                }
+
+            Write-Host "  Loaded $rowCount previously-processed paths. Walk will skip these." -ForegroundColor Cyan
+            Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Loaded $rowCount previously-processed paths from existing listing"
+        }
+
+        'O' {
+            Write-Host "Overwriting existing listing." -ForegroundColor Cyan
+            Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') OVERWRITE — deleting existing listing and starting fresh for $DrivePath"
+            Remove-Item -LiteralPath $filePath -Force
+        }
+
+        'X' {
+            Write-Host "Exiting." -ForegroundColor Yellow
+            Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Run aborted by user at startup prompt"
+            exit 0
+        }
+    }
+}
+
+# Create the listing file (fresh run) or leave it in place (resume).
+# Header is only written for a fresh file.
+if (-not $isResume) {
+    New-Item -Path $filePath -ItemType File -Force | Out-Null
+    $header = @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked") -Join [char]9
+    Add-Content -Path $filePath -Value $header
+}
 
 $currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
 Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath started at $currentTimeF"
 
-# Shared state threaded through the recursive walk
-$seenPaths      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# Shared state threaded through the recursive walk.
+# $seenPaths is already populated if this is a resume.
 $pendingBatch   = @()
 $pendingBatchR  = [ref]$pendingBatch
 $processedCount = [ref]0
@@ -391,6 +476,6 @@ if ($pendingBatchR.Value.Count -gt 0) {
 }
 
 $currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath ended at $currentTimeF — $($processedCount.Value) files processed"
+Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath ended at $currentTimeF — $($processedCount.Value) new files added this run"
 
 Write-Host "Listing complete: $filePath"

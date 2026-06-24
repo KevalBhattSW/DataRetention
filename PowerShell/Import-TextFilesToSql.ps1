@@ -30,14 +30,14 @@ param(
 
     [string]$SourceFolder     = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing",   # the ~40 already-unzipped .txt files
     [string]$ZipFolder        = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing\FilelistingZips",     # the ~15 .zip archives
-    [string]$WorkFolder       = "C:\Temp\Work",            # everything gets staged/unzipped here
+    [string]$WorkFolder       = "C:\Temp\Work\",            # everything gets staged/unzipped here
     [string]$LogFile          = "C:\Temp\import_log.csv",
 
     [switch]$CreateTable= $true,                                    # pass this switch to (re)create the table first
-    [switch]$DropTableIfExists,                               # pass this to DROP the table before creating it
+    [switch]$DropTableIfExists= $true,                               # pass this to DROP the table before creating it
 
 
-    [char]$Delimiter      = '|',
+    [char]$Delimiter      = "`t",
     [int]$BatchSize       = 5000  # rows sent to SQL Server per network round-trip
 )
 
@@ -241,8 +241,7 @@ if ($CreateTable) {
 IF OBJECT_ID('$TargetTable', 'U') IS NULL
 BEGIN
     CREATE TABLE $TargetTable (
-        Id              INT IDENTITY(1,1) PRIMARY KEY CLUSTERED,
-        Name         NVARCHAR(255)   NULL,
+        Name         NVARCHAR(500)   NULL,
         [Containing Path Size]         NVARCHAR(255)   NULL,
         [Last Modified]         NVARCHAR(255)   NULL,
         [Last Accessed]         NVARCHAR(255)   NULL,
@@ -256,7 +255,8 @@ BEGIN
         combined_date_scope bit,
         combined_date_scope_2026 bit,
         SourceFile      NVARCHAR(260)   NULL,
-        LoadDateTime    DATETIME2       NOT NULL DEFAULT SYSDATETIME()
+        LoadDateTime    DATETIME2       NOT NULL DEFAULT SYSDATETIME(),
+        Id              INT IDENTITY(1,1) PRIMARY KEY CLUSTERED
 
     );
 END
@@ -264,8 +264,7 @@ END
 IF OBJECT_ID('$StagingTable', 'U') IS NULL
 BEGIN
     CREATE TABLE $StagingTable (
-        Id              INT IDENTITY(1,1) PRIMARY KEY CLUSTERED,
-        Name         NVARCHAR(255)   NULL,
+        Name         NVARCHAR(500)   NULL,
         [Containing Path Size]         NVARCHAR(255)   NULL,
         [Last Modified]         NVARCHAR(255)   NULL,
         [Last Accessed]         NVARCHAR(255)   NULL,
@@ -276,10 +275,10 @@ BEGIN
         -- add/remove columns here to match your files, in file column order --
         clean_extension nvarchar(255) null,
         file_type nvarchar(255) null,
-        combined_date_scope bit,
-        combined_date_scope_2026 bit,
+        combined_date_scope NVARCHAR(260),
+        combined_date_scope_2026 NVARCHAR(260),
         SourceFile      NVARCHAR(260)   NULL,
-        LoadDateTime    DATETIME2       NOT NULL DEFAULT SYSDATETIME()
+        LoadDateTime    NVARCHAR(260)       NOT NULL DEFAULT SYSDATETIME()
 
     );
 END
@@ -303,6 +302,7 @@ foreach ($f in $plainFiles) {
     $dest = Join-Path $WorkFolder $f.Name
     if (-not (Test-Path $dest)) {
         Copy-Item -Path $f.FullName -Destination $dest
+    }
 
 
 
@@ -328,9 +328,10 @@ foreach ($f in $plainFiles) {
 
 
     # --- Load loop -----------------------------------------------------------
-    $txtFiles = Get-ChildItem -Path $WorkFolder -Filter "*.txt" -File | Sort-Object Name
+    #$txtFiles = Get-ChildItem -Path $WorkFolder -Filter "*.txt" -File | Sort-Object Name
 
-    foreach ($file in $txtFiles) {
+    #foreach ($file in $txtFiles) {
+        $file = Get-Item -Path $dest
         $csvReader = $null
         $bulkCopy  = $null
         try {
@@ -346,10 +347,10 @@ foreach ($f in $plainFiles) {
 
             # Map each column by name so order in the file doesn't need to
             # exactly match the physical column order in the table.
-            for ($i = 0; $i -lt $csvReader.FieldCount; $i++) {
-                $colName = $csvReader.GetName($i)
-                $bulkCopy.ColumnMappings.Add($colName, $colName) | Out-Null
-            }
+            #for ($i = 0; $i -lt $csvReader.FieldCount; $i++) {
+            #    $colName = $csvReader.GetName($i)
+            #    $bulkCopy.ColumnMappings.Add($colName, $colName) | Out-Null
+            #}
 
             $bulkCopy.WriteToServer($csvReader)
 
@@ -399,8 +400,8 @@ foreach ($f in $plainFiles) {
                     end,
                 combined_date_scope = 
                     case
-                        when dateadd(year,-3,cast(getdate as date)) > cast([Creation Date] as date)
-                            and dateadd(month,-18,cast(getdate as date)) > cast([Last Accessed] as date)
+                        when dateadd(year,-3,cast(getdate() as date)) > cast([Creation Date] as date)
+                            and dateadd(month,-18,cast(getdate() as date)) > cast([Last Accessed] as date)
                         then 1
                         else 0
                     end,
@@ -415,8 +416,34 @@ foreach ($f in $plainFiles) {
 
 
 
-            INSERT INTO $TargetTable
-            SELECT s.*, '$($file.Name)', SYSDATETIME()
+            INSERT INTO $TargetTable([Name]
+,[Containing Path Size]
+,[Last Modified]
+,[Last Accessed]
+,[Creation Date]
+,[Extension]
+,[Last Save Date]
+,[Date Checked]
+,[clean_extension]
+,[file_type]
+,[combined_date_scope]
+,[combined_date_scope_2026]
+,[SourceFile]
+,[LoadDateTime])
+            SELECT [Name]
+,[Containing Path Size]
+,[Last Modified]
+,[Last Accessed]
+,[Creation Date]
+,[Extension]
+,[Last Save Date]
+,[Date Checked]
+,[clean_extension]
+,[file_type]
+,[combined_date_scope]
+,[combined_date_scope_2026]
+,'$($file.Name)'
+,SYSDATETIME()
             FROM $stagingTable s;
 
 
@@ -424,7 +451,7 @@ foreach ($f in $plainFiles) {
             DROP TABLE $stagingTable;
             SELECT @rc AS RowsLoaded;
 "@
-
+write-host $bulkInsertSql
 
 
             try {
@@ -438,6 +465,7 @@ foreach ($f in $plainFiles) {
                 if ($reader.Read()) { $rows = $reader.GetInt32(0) }
                 $reader.Close()
                 $conn.Close()
+                Remove-Item $file.FullName
 
                 Write-LogEntry -File $file.Name -Status "SUCCESS" -Detail "Loaded OK" -RowsLoaded $rows
             }
@@ -456,8 +484,8 @@ foreach ($f in $plainFiles) {
         }
     }
 
-    }
-}
+    #}
+#}
 
 
 # ------------------------------------------------------------------

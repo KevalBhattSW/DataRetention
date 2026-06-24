@@ -43,6 +43,7 @@ $ErrorActionPreference = "Stop"
 # Appends SourceFile and LoadDateTime as virtual columns so the server
 # never needs to see the file path.
 # ------------------------------------------------------------------
+if (-not ([System.Management.Automation.PSTypeName]'CsvDataReader').Type) {
 Add-Type @"
 using System;
 using System.Data;
@@ -158,6 +159,7 @@ public class CsvDataReader : DbDataReader
     public override object this[string n] { get { return GetValue(GetOrdinal(n)); } }
 }
 "@ -ReferencedAssemblies "System.Data", "System.Xml"
+}
 
 # ------------------------------------------------------------------
 # 0. Setup
@@ -258,27 +260,21 @@ END
 }
 
 # ------------------------------------------------------------------
-# 2. Stage already-unzipped files into WorkFolder
+# 2. Per-file: copy one file, process it, delete it, move to next
+#    Only one copy of each file exists on disk at a time.
 # ------------------------------------------------------------------
-Write-Host "`n=== Step 2: Staging files ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 2: Loading files (one at a time) ===" -ForegroundColor Cyan
 
-$plainFiles = Get-ChildItem -Path $SourceFolder -Filter "*.txt" -File -ErrorAction SilentlyContinue
+$plainFiles = Get-ChildItem -Path $SourceFolder -Filter "*.txt" -File -ErrorAction SilentlyContinue |
+              Sort-Object Name
+
 foreach ($f in $plainFiles) {
+
+    # Copy single file into work folder
     $dest = Join-Path $WorkFolder $f.Name
-    if (-not (Test-Path $dest)) {
-        Copy-Item -Path $f.FullName -Destination $dest
-    }
-}
-Write-Host "  $($plainFiles.Count) file(s) staged."
+    Copy-Item -Path $f.FullName -Destination $dest -Force
 
-# ------------------------------------------------------------------
-# 3. Per-file: BulkCopy into staging, enrich, insert into target
-# ------------------------------------------------------------------
-Write-Host "`n=== Step 3: Loading files ===" -ForegroundColor Cyan
-
-$txtFiles = Get-ChildItem -Path $WorkFolder -Filter "*.txt" -File | Sort-Object Name
-
-foreach ($file in $txtFiles) {
+    $file      = Get-Item -Path $dest
     $csvReader = $null
     $bulkCopy  = $null
     try {
@@ -385,6 +381,10 @@ SELECT COUNT(*) FROM $StagingTable;
     finally {
         if ($bulkCopy  -and -not $bulkCopy.GetType().GetMethod('IsClosed')) { try { $bulkCopy.Close()  } catch {} }
         if ($csvReader -and -not $csvReader.IsClosed)                       { try { $csvReader.Close() } catch {} }
+
+        # Delete the work-folder copy regardless of success/failure so disk
+        # space is freed before the next file is copied in.
+        if (Test-Path $dest) { Remove-Item -Path $dest -Force }
     }
 }
 

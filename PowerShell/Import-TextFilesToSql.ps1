@@ -1,396 +1,414 @@
+<#
+.SYNOPSIS
+    Stages already-unzipped tab-delimited text files into SQL Server,
+    enriching each row with clean_extension, file_type, date-scope flags,
+    SourceFile, and LoadDateTime.
+
+.DESCRIPTION
+    Workflow:
+      1. Optionally creates the target and staging tables.
+      2. Copies .txt files from SourceFolder into WorkFolder.
+      3. For each file:
+           a. SqlBulkCopy streams it into the staging table (client-side read,
+              no server-side file access needed).
+           b. A single UPDATE enriches the staging rows.
+           c. INSERT...SELECT moves them into the target table.
+           d. Staging table is truncated ready for the next file.
+      4. Writes a CSV log and summary.
+#>
+
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$DrivePath,
+    [string]$SqlServer   = "LWUKWVNTV25\INS1,11433",
+    [string]$Database    = "unstrdata",
+    [string]$TargetTable = "dbo.catalogue_data",
+    [string]$StagingTable = "dbo.catalogue_data_staging",
 
-    [Parameter(Mandatory=$false)]
-    [int]$ParallelItems = 5,
+    [string]$SourceFolder = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing",
+    [string]$ZipFolder    = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing\FilelistingZips",
+    [string]$WorkFolder   = "C:\Temp\Work\",
+    [string]$LogFile      = "C:\Temp\import_log.csv",
 
-    [Parameter(Mandatory=$false)]
-    [int]$BatchSize = 200,
+    [switch]$CreateTable,
+    [switch]$DropTableIfExists,
 
-    [Parameter(Mandatory=$false)]
-    [string]$WorkingPath = "C:\temp\Unstructured\FileListing\",
-
-    [Parameter(Mandatory=$false)]
-    [string]$DriveLetter = $null,
-
-    [Parameter(Mandatory=$false)]
-    [string]$MappedPath = $null
+    [char]$Delimiter  = "`t",
+    [int]$BatchSize   = 5000
 )
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-if (-not (Test-Path -LiteralPath $DrivePath -PathType Container)) {
-    Write-Error "DrivePath '$DrivePath' does not exist or is not accessible. Aborting."
-    exit 1
-}
+$ErrorActionPreference = "Stop"
 
-if (($DriveLetter -and -not $MappedPath) -or (-not $DriveLetter -and $MappedPath)) {
-    Write-Error "Both -DriveLetter and -MappedPath must be provided together, or neither."
-    exit 1
-}
+# ------------------------------------------------------------------
+# CsvDataReader — reads tab-delimited files client-side for SqlBulkCopy.
+# Appends SourceFile and LoadDateTime as virtual columns so the server
+# never needs to see the file path.
+# ------------------------------------------------------------------
+if (-not ([System.Management.Automation.PSTypeName]'CsvDataReader').Type) {
+Add-Type @"
+using System;
+using System.Data;
+using System.Data.Common;
+using System.IO;
 
-if (-not (Test-Path -Path $WorkingPath -PathType Container)) {
-    New-Item -Path $WorkingPath -ItemType Directory -Force | Out-Null
-}
+public class CsvDataReader : DbDataReader
+{
+    private readonly StreamReader _reader;
+    private readonly char         _delimiter;
+    private readonly string       _sourceFile;
+    private readonly DateTime     _loadDt;
+    private readonly string[]     _headers;
+    private string[]              _current;
+    private bool                  _closed;
 
-$destinationPath = $WorkingPath
-$timestamp       = Get-Date -Format "yyyyMMdd_HHmmss"
+    private int DataColCount { get { return _headers.Length; } }
+    public  int RowCount     { get; private set; }
 
+    public CsvDataReader(string filePath, char delimiter)
+    {
+        _reader     = new StreamReader(filePath, System.Text.Encoding.UTF8, true);
+        _delimiter  = delimiter;
+        _sourceFile = System.IO.Path.GetFileName(filePath);
+        _loadDt     = DateTime.UtcNow;
 
-# ---------------------------------------------------------------------------
-# Add-ContentSafe
-# Thread-safe content writer with retry, since multiple runspaces will be
-# writing to the same progress log concurrently.
-# ---------------------------------------------------------------------------
-function Add-ContentSafe {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Value,
-        [int]$MaxRetries = 5,
-        [int]$RetryDelayMs = 200
-    )
+        var headerLine = _reader.ReadLine();
+        _headers = headerLine == null ? new string[0] : headerLine.Split(_delimiter);
+    }
 
-    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-        try {
-            Add-Content -Path $Path -Value $Value -ErrorAction Stop
-            return $true
+    public override int FieldCount { get { return _headers.Length + 2; } }
+
+    public override bool Read()
+    {
+        if (_closed) return false;
+        var line = _reader.ReadLine();
+        if (line == null) return false;
+        _current = line.Split(_delimiter);
+        RowCount++;
+        return true;
+    }
+
+    public override object GetValue(int i)
+    {
+        if (i < DataColCount)
+        {
+            if (_current == null || i >= _current.Length) return DBNull.Value;
+            var v = _current[i];
+            return string.IsNullOrEmpty(v) ? (object)DBNull.Value : v;
         }
-        catch {
-            if ($attempt -eq $MaxRetries) {
-                Write-Warning "Add-ContentSafe: failed to write to $Path after $MaxRetries retries: $($_.Exception.Message)"
-                return $false
-            }
-            Start-Sleep -Milliseconds $RetryDelayMs
-        }
+        if (i == DataColCount)     return _sourceFile;
+        if (i == DataColCount + 1) return _loadDt;
+        throw new IndexOutOfRangeException();
+    }
+
+    public override string GetName(int i)
+    {
+        if (i < DataColCount)      return _headers[i];
+        if (i == DataColCount)     return "SourceFile";
+        if (i == DataColCount + 1) return "LoadDateTime";
+        throw new IndexOutOfRangeException();
+    }
+
+    public override int GetOrdinal(string name)
+    {
+        for (int i = 0; i < _headers.Length; i++)
+            if (string.Equals(_headers[i], name, StringComparison.OrdinalIgnoreCase)) return i;
+        if (name == "SourceFile")   return DataColCount;
+        if (name == "LoadDateTime") return DataColCount + 1;
+        throw new IndexOutOfRangeException(name);
+    }
+
+    public override bool IsDBNull(int i)   { return GetValue(i) == DBNull.Value; }
+
+    public override int GetValues(object[] values)
+    {
+        int n = Math.Min(values.Length, FieldCount);
+        for (int i = 0; i < n; i++) values[i] = GetValue(i);
+        return n;
+    }
+
+    public override void Close()          { _closed = true; _reader.Dispose(); }
+    public override bool IsClosed         { get { return _closed; } }
+    public override int  Depth            { get { return 0; } }
+    public override int  RecordsAffected  { get { return -1; } }
+    public override bool HasRows          { get { return true; } }
+    public override bool NextResult()     { return false; }
+
+    public override bool     GetBoolean(int i)  { return Convert.ToBoolean(GetValue(i)); }
+    public override byte     GetByte(int i)     { return Convert.ToByte(GetValue(i)); }
+    public override char     GetChar(int i)     { return Convert.ToChar(GetValue(i)); }
+    public override Guid     GetGuid(int i)     { return Guid.Parse(GetValue(i).ToString()); }
+    public override short    GetInt16(int i)    { return Convert.ToInt16(GetValue(i)); }
+    public override int      GetInt32(int i)    { return Convert.ToInt32(GetValue(i)); }
+    public override long     GetInt64(int i)    { return Convert.ToInt64(GetValue(i)); }
+    public override float    GetFloat(int i)    { return Convert.ToSingle(GetValue(i)); }
+    public override double   GetDouble(int i)   { return Convert.ToDouble(GetValue(i)); }
+    public override decimal  GetDecimal(int i)  { return Convert.ToDecimal(GetValue(i)); }
+    public override DateTime GetDateTime(int i) { return Convert.ToDateTime(GetValue(i)); }
+    public override string   GetString(int i)   { return IsDBNull(i) ? null : GetValue(i).ToString(); }
+    public override string   GetDataTypeName(int i) { return "nvarchar"; }
+    public override Type     GetFieldType(int i)    { return typeof(string); }
+
+    public override long GetBytes(int i, long fo, byte[] buf, int bo, int len) { return 0; }
+    public override long GetChars(int i, long fo, char[] buf, int bo, int len) { return 0; }
+
+    public override System.Collections.IEnumerator GetEnumerator()
+    {
+        return new DbEnumerator(this, true);
+    }
+
+    public override object this[int i]    { get { return GetValue(i); } }
+    public override object this[string n] { get { return GetValue(GetOrdinal(n)); } }
+}
+"@ -ReferencedAssemblies "System.Data", "System.Xml"
+}
+
+# ------------------------------------------------------------------
+# 0. Setup
+# ------------------------------------------------------------------
+foreach ($folder in @($WorkFolder, (Split-Path $LogFile -Parent))) {
+    if (-not (Test-Path $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
     }
 }
 
+$connectionString = "Server=$SqlServer;Database=$Database;Integrated Security=True;"
 
-# ---------------------------------------------------------------------------
-# Process-FileListingBatch
-# Runs a chunk of files through the metadata-extraction logic in its own
-# runspace pool. Returns a batch-result object for Wait-AndCollectJobs.
-# ---------------------------------------------------------------------------
-function Process-FileListingBatch {
-    param(
-        [string[]]$batch,
-        [int]$parallelItems,
-        [string]$progressFile,
-        [string]$driveLetter,
-        [string]$mappedPath
-    )
-
-    if ($null -eq $batch -or $batch.Count -eq 0) { return $null }
-
-    $pool = [runspacefactory]::CreateRunspacePool(1, $parallelItems)
-    $pool.Open()
-
-    $fnAddContentSafe = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
-
-    $jobs = @()
-
-    foreach ($file in $batch) {
-
-        $ps = [powershell]::Create()
-        $ps.RunspacePool = $pool
-
-        $ps.AddScript($fnAddContentSafe) | Out-Null
-
-        $ps.AddScript({
-            param($objFile, $progressFile, $driveLetter, $mappedPath)
-
-            try {
-                $item = Get-Item -LiteralPath $objFile -ErrorAction Stop
-            }
-            catch {
-                Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $objFile could not be opened: $($_.Exception.Message)"
-                return $null
-            }
-
-            # Skip Office temp/lock files — "~$" prefix on the filename itself.
-            if ($item.Name.StartsWith("~$")) {
-                return $null
-            }
-
-            $currentFileSize = $item.Length.ToString()
-            $fileNameOnly    = $item.Name
-            $filePath        = $item.DirectoryName
-            $extension       = $item.Extension
-
-            if ($driveLetter -and $mappedPath) {
-                if ($filePath.StartsWith("$driveLetter`:")) {
-                    $relativePath = $filePath.Substring(3)
-                    $filePath = Join-Path -Path $mappedPath -ChildPath $relativePath
-                }
-            }
-
-            $dtLastAccessedDoc = $item.LastAccessTime
-            $dtCreated         = $item.CreationTime
-            $dtLastModified    = $item.LastWriteTime
-
-            # Preserve original timestamps across the read
-            $fileReadOnly = $false
-            try {
-                if ($item.IsReadOnly -eq $true) {
-                    $item.IsReadOnly = $false
-                    $fileReadOnly = $true
-                }
-
-                if (($item.LastWriteTime -ne $dtLastModified) -or ($item.LastAccessTime -ne $dtLastAccessedDoc)) {
-                    $item.LastWriteTime = $dtLastModified
-                    Start-Sleep -Milliseconds 100
-                    $item.LastAccessTime = $dtLastAccessedDoc
-                }
-
-                if ($fileReadOnly -eq $true) {
-                    $item.IsReadOnly = $true
-                }
-            }
-            catch {
-                $msg     = $_.Exception.Message
-                $hresult = if ($_.Exception.HResult) { '{0:X8}' -f $_.Exception.HResult } else { $null }
-                if ($msg -match 'being used by another process' -or $hresult -eq '80070020') {
-                    Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $objFile timestamp restore skipped; file in use"
-                }
-                else {
-                    Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $objFile timestamp restore failed: $msg"
-                }
-            }
-
-            $runTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-
-            return [pscustomobject]@{
-                Name           = $fileNameOnly
-                ContainingPath = $filePath
-                Size           = $currentFileSize
-                LastModified   = $dtLastModified
-                LastAccessed   = $dtLastAccessedDoc
-                CreationDate   = $dtCreated
-                Extension      = $extension
-                LastSaveDate   = $dtLastModified
-                DateChecked    = $runTimeF
-            }
-
-        }) | Out-Null
-
-        $ps.AddArgument($file)         | Out-Null
-        $ps.AddArgument($progressFile) | Out-Null
-        $ps.AddArgument($driveLetter)  | Out-Null
-        $ps.AddArgument($mappedPath)   | Out-Null
-
-        $jobs += [pscustomobject]@{
-            Pipe   = $ps
-            Handle = $ps.BeginInvoke()
-        }
+function Invoke-Sql {
+    param([string]$Query, [int]$TimeoutSeconds = 0)
+    $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    try {
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText    = $Query
+        $cmd.CommandTimeout = $TimeoutSeconds
+        $cmd.ExecuteNonQuery() | Out-Null
     }
-
-    return [pscustomobject]@{ Jobs = $jobs; Pool = $pool }
+    finally { $conn.Close() }
 }
 
-
-# ---------------------------------------------------------------------------
-# Wait-AndCollectJobs
-# ---------------------------------------------------------------------------
-function Wait-AndCollectJobs {
-    param($BatchResult)
-
-    $collected = [System.Collections.Generic.List[object]]::new()
-
-    if ($null -eq $BatchResult) { return $collected }
-
-    foreach ($job in $BatchResult.Jobs) {
-        if ($null -eq $job -or $null -eq $job.Pipe -or $null -eq $job.Handle) { continue }
-
-        $job.Handle.AsyncWaitHandle.WaitOne()
-        try {
-            $output = $job.Pipe.EndInvoke($job.Handle)
-            if ($output) { $collected.AddRange([object[]]$output) }
-        }
-        catch {
-            Write-Warning "Runspace error: $($_.Exception.Message)"
-        }
-        finally {
-            $job.Pipe.Dispose()
-        }
+$logEntries = New-Object System.Collections.Generic.List[object]
+function Write-LogEntry {
+    param([string]$File, [string]$Status, [string]$Detail, [int]$RowsLoaded = -1)
+    $entry = [PSCustomObject]@{
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+        File         = $File
+        Status       = $Status
+        RowsLoaded   = $RowsLoaded
+        Detail       = $Detail
     }
-
-    if ($BatchResult.Pool) {
-        $BatchResult.Pool.Close()
-        $BatchResult.Pool.Dispose()
-    }
-
-    return $collected
+    $logEntries.Add($entry)
+    $color = if ($Status -eq "SUCCESS") { "Green" } else { "Red" }
+    Write-Host ("[{0}] {1} - {2}" -f $Status, $File, $Detail) -ForegroundColor $color
 }
 
+# ------------------------------------------------------------------
+# 1. Create tables
+# Note: staging table uses NVARCHAR for all columns so SqlBulkCopy
+#       can push raw strings in without type conversion errors.
+#       combined_date_scope columns are BIT in the target but derived
+#       via CAST in the INSERT...SELECT, not stored as strings.
+# ------------------------------------------------------------------
+if ($CreateTable) {
+    Write-Host "`n=== Step 1: Creating tables ===" -ForegroundColor Cyan
 
-# ---------------------------------------------------------------------------
-# Invoke-FlushBatch
-# Dispatches a pending batch to the runspace pool, collects results, and
-# writes them immediately to the output file. Called from within the
-# directory walk so that files are written as soon as a batch fills up
-# rather than after the entire tree has been enumerated.
-# ---------------------------------------------------------------------------
-function Invoke-FlushBatch {
-    param(
-        [string[]]$batch,
-        [string]$outputFile,
-        [string]$progressFile,
-        [int]$parallelItems,
-        [string]$driveLetter,
-        [string]$mappedPath,
-        [ref]$processedCount
-    )
-
-    if ($batch.Count -eq 0) { return }
-
-    $batchResult = Process-FileListingBatch `
-        -batch         $batch `
-        -parallelItems $parallelItems `
-        -progressFile  $progressFile `
-        -driveLetter   $driveLetter `
-        -mappedPath    $mappedPath
-
-    $rows = Wait-AndCollectJobs -BatchResult $batchResult
-
-    foreach ($row in $rows) {
-        $listEntry = @(
-            $row.Name, $row.ContainingPath, $row.Size, $row.LastModified,
-            $row.LastAccessed, $row.CreationDate, $row.Extension,
-            $row.LastSaveDate, $row.DateChecked
-        ) -Join [char]9
-        Add-Content -Path $outputFile -Value $listEntry
+    if ($DropTableIfExists) {
+        Invoke-Sql -Query "IF OBJECT_ID('$TargetTable',  'U') IS NOT NULL DROP TABLE $TargetTable;"
+        Invoke-Sql -Query "IF OBJECT_ID('$StagingTable', 'U') IS NOT NULL DROP TABLE $StagingTable;"
     }
 
-    $processedCount.Value += $batch.Count
+    $createSql = @"
+IF OBJECT_ID('$TargetTable', 'U') IS NULL
+BEGIN
+    CREATE TABLE $TargetTable (
+        Id                       INT           IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+        [Name]                   NVARCHAR(500) NULL,
+        [Containing Path]        NVARCHAR(255) NULL,
+        [Size]                   NVARCHAR(50)  NULL,
+        [Last Modified]          NVARCHAR(255) NULL,
+        [Last Accessed]          NVARCHAR(255) NULL,
+        [Creation Date]          NVARCHAR(255) NULL,
+        [Extension]              NVARCHAR(255) NULL,
+        [Last Save Date]         NVARCHAR(255) NULL,
+        [Date Checked]           NVARCHAR(255) NULL,
+        clean_extension          NVARCHAR(255) NULL,
+        file_type                NVARCHAR(255) NULL,
+        combined_date_scope      BIT           NULL,
+        combined_date_scope_2026 BIT           NULL,
+        SourceFile               NVARCHAR(260) NULL,
+        LoadDateTime             DATETIME2     NOT NULL DEFAULT SYSDATETIME()
+    );
+END
+
+IF OBJECT_ID('$StagingTable', 'U') IS NULL
+BEGIN
+    CREATE TABLE $StagingTable (
+        [Name]           NVARCHAR(500) NULL,
+        [Containing Path] NVARCHAR(255) NULL,
+        [Size]           NVARCHAR(50)  NULL,
+        [Last Modified]  NVARCHAR(255) NULL,
+        [Last Accessed]  NVARCHAR(255) NULL,
+        [Creation Date]  NVARCHAR(255) NULL,
+        [Extension]      NVARCHAR(255) NULL,
+        [Last Save Date] NVARCHAR(255) NULL,
+        [Date Checked]   NVARCHAR(255) NULL,
+        SourceFile       NVARCHAR(260) NULL,
+        LoadDateTime     NVARCHAR(50)  NULL
+    );
+END
+"@
+    Invoke-Sql -Query $createSql
+    Write-Host "  Tables ready." -ForegroundColor Green
 }
 
+# ------------------------------------------------------------------
+# 2. Per-file: copy one file, process it, delete it, move to next
+#    Only one copy of each file exists on disk at a time.
+# ------------------------------------------------------------------
+Write-Host "`n=== Step 2: Loading files (one at a time) ===" -ForegroundColor Cyan
 
-# ---------------------------------------------------------------------------
-# Walk-AndProcess
-# Recursive directory walk that fills a rolling batch buffer and flushes it
-# to disk as soon as it reaches $BatchSize — without ever holding the full
-# file list in memory. The $seenPaths HashSet deduplicates across the walk
-# (replacing the post-walk Sort-Object -Unique that previously required the
-# entire list to be in memory at once).
-#
-# Excludes snapshot folders (any folder named "~snapshot", case-insensitive).
-# ---------------------------------------------------------------------------
-function Walk-AndProcess {
-    param(
-        [string]$FolderName,
-        [string]$OutputFile,
-        [string]$ProgressFile,
-        [int]$ParallelItems,
-        [int]$BatchSize,
-        [string]$DriveLetter,
-        [string]$MappedPath,
-        [System.Collections.Generic.HashSet[string]]$SeenPaths,
-        [string[]]$PendingBatch,          # passed by value; returned via [ref] pattern below
-        [ref]$PendingBatchRef,
-        [ref]$ProcessedCount
-    )
+$plainFiles = Get-ChildItem -Path $SourceFolder -Filter "*.txt" -File -ErrorAction SilentlyContinue |
+              Sort-Object Name
 
-    # Enumerate files in this folder and add unseen ones to the pending batch
-    $localFiles = Get-ChildItem -Path $FolderName -File -ErrorAction SilentlyContinue
-    foreach ($file in $localFiles) {
-        $fp = $file.FullName
-        if ($SeenPaths.Add($fp)) {           # Add returns $false if already present
-            $PendingBatchRef.Value += $fp
+foreach ($f in $plainFiles) {
 
-            if ($PendingBatchRef.Value.Count -ge $BatchSize) {
-                Add-ContentSafe -Path $ProgressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Flushing batch at $($ProcessedCount.Value + $PendingBatchRef.Value.Count) files (in $FolderName)"
-                Invoke-FlushBatch `
-                    -batch          $PendingBatchRef.Value `
-                    -outputFile     $OutputFile `
-                    -progressFile   $ProgressFile `
-                    -parallelItems  $ParallelItems `
-                    -driveLetter    $DriveLetter `
-                    -mappedPath     $MappedPath `
-                    -processedCount $ProcessedCount
-                $PendingBatchRef.Value = @()
-                [System.GC]::Collect()
-            }
+    # Copy single file into work folder
+    $dest = Join-Path $WorkFolder $f.Name
+    Copy-Item -Path $f.FullName -Destination $dest -Force
+
+    $file      = Get-Item -Path $dest
+    $csvReader = $null
+    $bulkCopy  = $null
+    try {
+        # a) Truncate staging ready for this file
+        Invoke-Sql -Query "TRUNCATE TABLE $StagingTable;"
+
+        # b) Stream file into staging via SqlBulkCopy
+        $csvReader = New-Object CsvDataReader($file.FullName, $Delimiter)
+
+        $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy(
+            $connectionString,
+            [System.Data.SqlClient.SqlBulkCopyOptions]::TableLock
+        )
+        $bulkCopy.DestinationTableName = $StagingTable
+        $bulkCopy.BatchSize            = $BatchSize
+        $bulkCopy.BulkCopyTimeout      = 0
+
+
+        # Explicit mappings: file column name -> staging table column name.
+        @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked","SourceFile","LoadDateTime") | ForEach-Object {
+            $bulkCopy.ColumnMappings.Add($_, $_) | Out-Null
         }
+
+        $bulkCopy.WriteToServer($csvReader)
+        $bulkCopy.Close()
+        $csvReader.Close()
+
+        # c) Enrich staging + insert into target in one SQL batch
+        $enrichSql = @"
+UPDATE $StagingTable
+SET
+    SourceFile   = '$($file.Name)',
+    LoadDateTime = CONVERT(NVARCHAR(50), SYSDATETIME(), 126);
+
+INSERT INTO $TargetTable (
+    [Name], [Containing Path], [Size],
+    [Last Modified], [Last Accessed], [Creation Date],
+    [Extension], [Last Save Date], [Date Checked],
+    clean_extension, file_type,
+    combined_date_scope, combined_date_scope_2026,
+    SourceFile, LoadDateTime
+)
+SELECT
+    [Name],
+    [Containing Path],
+    [Size],
+    [Last Modified],
+    [Last Accessed],
+    [Creation Date],
+    [Extension],
+    [Last Save Date],
+    [Date Checked],
+    -- clean_extension
+    CASE
+        WHEN RIGHT(LOWER([Extension]),3) = 'pdf'  THEN '.pdf'
+        WHEN RIGHT(LOWER([Extension]),4) = 'docx' THEN '.docx'
+        WHEN RIGHT(LOWER([Extension]),4) = 'docm' THEN '.docm'
+        WHEN RIGHT(LOWER([Extension]),3) = 'doc'  THEN '.doc'
+        WHEN RIGHT(LOWER([Extension]),4) = 'xlsx' THEN '.xlsx'
+        WHEN RIGHT(LOWER([Extension]),4) = 'xlsm' THEN '.xlsm'
+        WHEN RIGHT(LOWER([Extension]),4) = 'xlsb' THEN '.xlsb'
+        WHEN RIGHT(LOWER([Extension]),3) = 'xls'  THEN '.xls'
+        WHEN RIGHT(LOWER([Extension]),4) = 'pptx' THEN '.pptx'
+        WHEN RIGHT(LOWER([Extension]),4) = 'pptm' THEN '.pptm'
+        WHEN RIGHT(LOWER([Extension]),3) = 'ppt'  THEN '.ppt'
+        ELSE 'Other'
+    END,
+    -- file_type
+    CASE
+        WHEN RIGHT(LOWER([Extension]),4) IN ('docx','docm','xlsx','xlsm','xlsb','pptx','pptm') THEN 'OpenXML'
+        WHEN RIGHT(LOWER([Extension]),3) IN ('doc','xls','ppt')                                THEN 'COM'
+        WHEN RIGHT(LOWER([Extension]),3) = 'pdf'                                               THEN 'PDF'
+        ELSE 'Other'
+    END,
+    -- combined_date_scope
+    CAST(CASE
+        WHEN DATEADD(YEAR,-3,CAST(GETDATE() AS DATE)) > TRY_CAST([Creation Date] AS DATE)
+         AND DATEADD(MONTH,-18,CAST(GETDATE() AS DATE)) > TRY_CAST([Last Accessed] AS DATE)
+        THEN 1 ELSE 0
+    END AS BIT),
+    -- combined_date_scope_2026
+    CAST(CASE
+        WHEN DATEADD(YEAR,-3,DATEFROMPARTS(2026,12,31)) > TRY_CAST([Creation Date] AS DATE)
+         AND DATEADD(MONTH,-18,DATEFROMPARTS(2026,12,31)) > TRY_CAST([Last Accessed] AS DATE)
+        THEN 1 ELSE 0
+    END AS BIT),
+    SourceFile,
+    SYSDATETIME()
+FROM $StagingTable;
+
+SELECT COUNT(*) FROM $StagingTable;
+"@
+
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText    = $enrichSql
+        $cmd.CommandTimeout = 0
+        $reader = $cmd.ExecuteReader()
+        $rows = 0
+        if ($reader.Read()) { $rows = $reader.GetInt32(0) }
+        $reader.Close()
+        $conn.Close()
+
+        Write-LogEntry -File $file.Name -Status "SUCCESS" -Detail "Loaded OK" -RowsLoaded $rows
     }
+    catch {
+        Write-LogEntry -File $file.Name -Status "FAILED" -Detail $_.Exception.Message
+    }
+    finally {
+        if ($bulkCopy  -and -not $bulkCopy.GetType().GetMethod('IsClosed')) { try { $bulkCopy.Close()  } catch {} }
+        if ($csvReader -and -not $csvReader.IsClosed)                       { try { $csvReader.Close() } catch {} }
 
-    # Recurse into sub-folders
-    $subFolders = Get-ChildItem -Path $FolderName -Directory -ErrorAction SilentlyContinue
-    foreach ($subFolder in $subFolders) {
-
-        if ($subFolder.Name -ieq "~snapshot") {
-            Write-Host "Skipping snapshot folder: $($subFolder.FullName)"
-            continue
-        }
-
-        Write-Host "Recursing into subfolder: $($subFolder.FullName)"
-        Walk-AndProcess `
-            -FolderName      $subFolder.FullName `
-            -OutputFile      $OutputFile `
-            -ProgressFile    $ProgressFile `
-            -ParallelItems   $ParallelItems `
-            -BatchSize       $BatchSize `
-            -DriveLetter     $DriveLetter `
-            -MappedPath      $MappedPath `
-            -SeenPaths       $SeenPaths `
-            -PendingBatch    $PendingBatchRef.Value `
-            -PendingBatchRef $PendingBatchRef `
-            -ProcessedCount  $ProcessedCount
+        # Delete the work-folder copy regardless of success/failure so disk
+        # space is freed before the next file is copied in.
+        if (Test-Path $dest) { Remove-Item -Path $dest -Force }
     }
 }
 
+# ------------------------------------------------------------------
+# 4. Log and summary
+# ------------------------------------------------------------------
+$logEntries | Export-Csv -Path $LogFile -NoTypeInformation -Encoding UTF8
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-$filename     = ($DrivePath.Replace('\','_').Replace(':',''))
-$filePath     = "$destinationPath$($timestamp)_$($filename)_DriveListing.txt"
-$progressFile = "$destinationPath$($timestamp)_DriveListingProgress.txt"
+$successCount = ($logEntries | Where-Object Status -eq "SUCCESS").Count
+$failCount    = ($logEntries | Where-Object Status -eq "FAILED").Count
+$totalRows    = ($logEntries | Where-Object Status -eq "SUCCESS" | Measure-Object -Property RowsLoaded -Sum).Sum
 
-New-Item -Path $progressFile -ItemType File -Force | Out-Null
+Write-Host "`n=== Summary ===" -ForegroundColor Cyan
+Write-Host "  Succeeded : $successCount" -ForegroundColor Green
+Write-Host "  Failed    : $failCount"    -ForegroundColor $(if ($failCount -gt 0) {"Red"} else {"Green"})
+Write-Host "  Total rows: $totalRows"
+Write-Host "  Log       : $LogFile"
 
-# Create output file with header immediately
-New-Item -Path $filePath -ItemType File -Force | Out-Null
-$header = @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked") -Join [char]9
-Add-Content -Path $filePath -Value $header
-
-$currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath started at $currentTimeF"
-
-# Shared state threaded through the recursive walk
-$seenPaths      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$pendingBatch   = @()
-$pendingBatchR  = [ref]$pendingBatch
-$processedCount = [ref]0
-
-Walk-AndProcess `
-    -FolderName      $DrivePath `
-    -OutputFile      $filePath `
-    -ProgressFile    $progressFile `
-    -ParallelItems   $ParallelItems `
-    -BatchSize       $BatchSize `
-    -DriveLetter     $DriveLetter `
-    -MappedPath      $MappedPath `
-    -SeenPaths       $seenPaths `
-    -PendingBatch    $pendingBatchR.Value `
-    -PendingBatchRef $pendingBatchR `
-    -ProcessedCount  $processedCount
-
-# Flush any remaining files that didn't fill a complete batch
-if ($pendingBatchR.Value.Count -gt 0) {
-    Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Flushing final batch of $($pendingBatchR.Value.Count) files"
-    Invoke-FlushBatch `
-        -batch          $pendingBatchR.Value `
-        -outputFile     $filePath `
-        -progressFile   $progressFile `
-        -parallelItems  $ParallelItems `
-        -driveLetter    $DriveLetter `
-        -mappedPath     $MappedPath `
-        -processedCount $processedCount
+if ($failCount -gt 0) {
+    Write-Host "`n  Review $LogFile for details on failed files." -ForegroundColor Yellow
 }
-
-$currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath ended at $currentTimeF — $($processedCount.Value) files processed"
-
-Write-Host "Listing complete: $filePath"

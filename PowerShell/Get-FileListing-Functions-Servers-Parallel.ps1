@@ -69,70 +69,20 @@ function Add-ContentSafe {
 
 
 # ---------------------------------------------------------------------------
-# Get-ApplicableFiles
-# Recursively walks the drive/folder and builds the full file list.
-# Unchanged from the original, single-threaded — this is a cheap filesystem
-# walk and doesn't benefit meaningfully from parallelisation; the expensive
-# part is the per-file metadata/timestamp work done afterwards.
-#
-# Excludes:
-#   - Snapshot folders (any folder named "~snapshot", case-insensitive)
-#     at any depth, so a single nested snapshot doesn't get walked and
-#     doesn't multiply every file beneath it across snapshot generations.
-# ---------------------------------------------------------------------------
-function Get-ApplicableFiles {
-    param (
-        [System.Collections.ArrayList]$Files,
-        [string]$FolderName
-    )
-
-    if (-not (Test-Path -Path $FolderName -PathType Container)) {
-        Write-Error "Folder $FolderName does not exist."
-        return
-    }
-
-    $rootFiles = Get-ChildItem -Path $FolderName -File -ErrorAction SilentlyContinue
-    foreach ($file in $rootFiles) {
-        $Files.Add($file.FullName) | Out-Null
-    }
-
-    $subFolders = Get-ChildItem -Path $FolderName -Directory -ErrorAction SilentlyContinue
-    foreach ($subFolder in $subFolders) {
-
-        if ($subFolder.Name -ieq "~snapshot") {
-            Write-Host "Skipping snapshot folder: $($subFolder.FullName)"
-            continue
-        }
-
-        $subFiles = Get-ChildItem -Path $subFolder.FullName -File -ErrorAction SilentlyContinue
-        foreach ($file in $subFiles) {
-            $Files.Add($file.FullName) | Out-Null
-        }
-
-        Write-Host "Recursing into subfolder: $($subFolder.FullName)"
-        Get-ApplicableFiles -Files $Files -FolderName $subFolder.FullName
-    }
-}
-
-
-# ---------------------------------------------------------------------------
 # Process-FileListingBatch
 # Runs a chunk of files through the metadata-extraction logic in its own
-# runspace. Mirrors the structure used in the tagging script's batch
-# functions — function bodies injected as named functions, results
-# returned as objects rather than written directly (avoids contention on
-# the output file itself; only the progress log is written concurrently).
+# runspace pool. Returns a batch-result object for Wait-AndCollectJobs.
 # ---------------------------------------------------------------------------
 function Process-FileListingBatch {
     param(
-        [System.Collections.ArrayList]$batch,
+        [string[]]$batch,
         [int]$parallelItems,
         [string]$progressFile,
         [string]$driveLetter,
         [string]$mappedPath
     )
 
-    if ($null -eq $batch -or $batch.Count -eq 0) { return @() }
+    if ($null -eq $batch -or $batch.Count -eq 0) { return $null }
 
     $pool = [runspacefactory]::CreateRunspacePool(1, $parallelItems)
     $pool.Open()
@@ -159,12 +109,7 @@ function Process-FileListingBatch {
                 return $null
             }
 
-            # Skip Office temp/lock files — these have the "~$" prefix on the
-            # FILENAME itself (e.g. "~$document.docx"), not the path. The
-            # original check tested the full path's first character, which
-            # would incorrectly skip every file inside a folder that happened
-            # to start with "~" (such as a literal "~snapshot" folder if it
-            # weren't already excluded during the walk).
+            # Skip Office temp/lock files — "~$" prefix on the filename itself.
             if ($item.Name.StartsWith("~$")) {
                 return $null
             }
@@ -185,8 +130,7 @@ function Process-FileListingBatch {
             $dtCreated         = $item.CreationTime
             $dtLastModified    = $item.LastWriteTime
 
-            # Preserve original timestamps across the read — IsReadOnly flag
-            # toggled only if needed, restored afterwards
+            # Preserve original timestamps across the read
             $fileReadOnly = $false
             try {
                 if ($item.IsReadOnly -eq $true) {
@@ -215,19 +159,18 @@ function Process-FileListingBatch {
                 }
             }
 
-            $runTime  = Get-Date
-            $runTimeF = $runTime.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+            $runTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
 
             return [pscustomobject]@{
-                Name             = $fileNameOnly
-                ContainingPath   = $filePath
-                Size             = $currentFileSize
-                LastModified     = $dtLastModified
-                LastAccessed     = $dtLastAccessedDoc
-                CreationDate     = $dtCreated
-                Extension        = $extension
-                LastSaveDate     = $dtLastModified
-                DateChecked      = $runTimeF
+                Name           = $fileNameOnly
+                ContainingPath = $filePath
+                Size           = $currentFileSize
+                LastModified   = $dtLastModified
+                LastAccessed   = $dtLastAccessedDoc
+                CreationDate   = $dtCreated
+                Extension      = $extension
+                LastSaveDate   = $dtLastModified
+                DateChecked    = $runTimeF
             }
 
         }) | Out-Null
@@ -253,7 +196,7 @@ function Process-FileListingBatch {
 function Wait-AndCollectJobs {
     param($BatchResult)
 
-    $collected = @()
+    $collected = [System.Collections.Generic.List[object]]::new()
 
     if ($null -eq $BatchResult) { return $collected }
 
@@ -263,7 +206,7 @@ function Wait-AndCollectJobs {
         $job.Handle.AsyncWaitHandle.WaitOne()
         try {
             $output = $job.Pipe.EndInvoke($job.Handle)
-            if ($output) { $collected += $output }
+            if ($output) { $collected.AddRange([object[]]$output) }
         }
         catch {
             Write-Warning "Runspace error: $($_.Exception.Message)"
@@ -283,71 +226,118 @@ function Wait-AndCollectJobs {
 
 
 # ---------------------------------------------------------------------------
-# List-FileAgeProperties
-# Chunks the unique file list into batches and dispatches them to
-# Process-FileListingBatch, writing results to the output file as each
-# batch completes (rather than holding everything in memory until the end).
+# Invoke-FlushBatch
+# Dispatches a pending batch to the runspace pool, collects results, and
+# writes them immediately to the output file. Called from within the
+# directory walk so that files are written as soon as a batch fills up
+# rather than after the entire tree has been enumerated.
 # ---------------------------------------------------------------------------
-function List-FileAgeProperties {
-    param (
-        [System.Collections.ArrayList]$Files,
-        [string]$Filename,
+function Invoke-FlushBatch {
+    param(
+        [string[]]$batch,
+        [string]$outputFile,
+        [string]$progressFile,
+        [int]$parallelItems,
+        [string]$driveLetter,
+        [string]$mappedPath,
+        [ref]$processedCount
+    )
+
+    if ($batch.Count -eq 0) { return }
+
+    $batchResult = Process-FileListingBatch `
+        -batch         $batch `
+        -parallelItems $parallelItems `
+        -progressFile  $progressFile `
+        -driveLetter   $driveLetter `
+        -mappedPath    $mappedPath
+
+    $rows = Wait-AndCollectJobs -BatchResult $batchResult
+
+    foreach ($row in $rows) {
+        $listEntry = @(
+            $row.Name, $row.ContainingPath, $row.Size, $row.LastModified,
+            $row.LastAccessed, $row.CreationDate, $row.Extension,
+            $row.LastSaveDate, $row.DateChecked
+        ) -Join [char]9
+        Add-Content -Path $outputFile -Value $listEntry
+    }
+
+    $processedCount.Value += $batch.Count
+}
+
+
+# ---------------------------------------------------------------------------
+# Walk-AndProcess
+# Recursive directory walk that fills a rolling batch buffer and flushes it
+# to disk as soon as it reaches $BatchSize — without ever holding the full
+# file list in memory. The $seenPaths HashSet deduplicates across the walk
+# (replacing the post-walk Sort-Object -Unique that previously required the
+# entire list to be in memory at once).
+#
+# Excludes snapshot folders (any folder named "~snapshot", case-insensitive).
+# ---------------------------------------------------------------------------
+function Walk-AndProcess {
+    param(
+        [string]$FolderName,
+        [string]$OutputFile,
         [string]$ProgressFile,
         [int]$ParallelItems,
         [int]$BatchSize,
-        [string]$DriveLetter = $null,
-        [string]$MappedPath = $null
+        [string]$DriveLetter,
+        [string]$MappedPath,
+        [System.Collections.Generic.HashSet[string]]$SeenPaths,
+        [string[]]$PendingBatch,          # passed by value; returned via [ref] pattern below
+        [ref]$PendingBatchRef,
+        [ref]$ProcessedCount
     )
 
-    if (-not (Test-Path -Path $ProgressFile -PathType Leaf)) {
-        Write-Error "File $ProgressFile does not exist"
-        return $null
+    # Enumerate files in this folder and add unseen ones to the pending batch
+    $localFiles = Get-ChildItem -Path $FolderName -File -ErrorAction SilentlyContinue
+    foreach ($file in $localFiles) {
+        $fp = $file.FullName
+        if ($SeenPaths.Add($fp)) {           # Add returns $false if already present
+            $PendingBatchRef.Value += $fp
+
+            if ($PendingBatchRef.Value.Count -ge $BatchSize) {
+                Add-ContentSafe -Path $ProgressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Flushing batch at $($ProcessedCount.Value + $PendingBatchRef.Value.Count) files (in $FolderName)"
+                Invoke-FlushBatch `
+                    -batch          $PendingBatchRef.Value `
+                    -outputFile     $OutputFile `
+                    -progressFile   $ProgressFile `
+                    -parallelItems  $ParallelItems `
+                    -driveLetter    $DriveLetter `
+                    -mappedPath     $MappedPath `
+                    -processedCount $ProcessedCount
+                $PendingBatchRef.Value = @()
+                [System.GC]::Collect()
+            }
+        }
     }
 
-    $currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-    Add-ContentSafe -Path $ProgressFile -Value "Catalogue for $Filename started at $currentTimeF"
+    # Recurse into sub-folders
+    $subFolders = Get-ChildItem -Path $FolderName -Directory -ErrorAction SilentlyContinue
+    foreach ($subFolder in $subFolders) {
 
-    # Create output file with header
-    New-Item -Path $Filename -ItemType File -Force | Out-Null
-    $header = @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked") -Join [char]9
-    Add-Content -Path $Filename -Value $header
-
-    $totalFiles = $Files.Count
-    $processed  = 0
-
-    # Chunk the file list into batches for parallel dispatch
-    for ($start = 0; $start -lt $totalFiles; $start += $BatchSize) {
-        $end = [Math]::Min($start + $BatchSize - 1, $totalFiles - 1)
-        $chunk = [System.Collections.ArrayList]@($Files[$start..$end])
-
-        Add-ContentSafe -Path $ProgressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Dispatching batch $($start+1)-$($end+1) of $totalFiles"
-
-        $batchResult = Process-FileListingBatch `
-            -batch         $chunk `
-            -parallelItems $ParallelItems `
-            -progressFile  $ProgressFile `
-            -driveLetter   $DriveLetter `
-            -mappedPath    $MappedPath
-
-        $rows = Wait-AndCollectJobs -BatchResult $batchResult
-
-        foreach ($row in $rows) {
-            $listEntry = @(
-                $row.Name, $row.ContainingPath, $row.Size, $row.LastModified,
-                $row.LastAccessed, $row.CreationDate, $row.Extension,
-                $row.LastSaveDate, $row.DateChecked
-            ) -Join [char]9
-            Add-Content -Path $Filename -Value $listEntry
+        if ($subFolder.Name -ieq "~snapshot") {
+            Write-Host "Skipping snapshot folder: $($subFolder.FullName)"
+            continue
         }
 
-        $processed += $chunk.Count
-        Write-Progress -Activity "Scanning files" -Status "$processed of $totalFiles" -PercentComplete (($processed / $totalFiles) * 100)
+        Write-Host "Recursing into subfolder: $($subFolder.FullName)"
+        Walk-AndProcess `
+            -FolderName      $subFolder.FullName `
+            -OutputFile      $OutputFile `
+            -ProgressFile    $ProgressFile `
+            -ParallelItems   $ParallelItems `
+            -BatchSize       $BatchSize `
+            -DriveLetter     $DriveLetter `
+            -MappedPath      $MappedPath `
+            -SeenPaths       $SeenPaths `
+            -PendingBatch    $PendingBatchRef.Value `
+            -PendingBatchRef $PendingBatchRef `
+            -ProcessedCount  $ProcessedCount
     }
-
-    Write-Progress -Activity "Scanning files" -Completed
-
-    $currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-    Add-ContentSafe -Path $ProgressFile -Value "Catalogue for $Filename ended at $currentTimeF"
 }
 
 
@@ -360,30 +350,47 @@ $progressFile = "$destinationPath$($timestamp)_DriveListingProgress.txt"
 
 New-Item -Path $progressFile -ItemType File -Force | Out-Null
 
-$filesToScan = New-Object System.Collections.ArrayList
+# Create output file with header immediately
+New-Item -Path $filePath -ItemType File -Force | Out-Null
+$header = @("Name","Containing Path","Size","Last Modified","Last Accessed","Creation Date","Extension","Last Save Date","Date Checked") -Join [char]9
+Add-Content -Path $filePath -Value $header
 
 $currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Add-ContentSafe -Path $progressFile -Value "Scanning for $DrivePath started at $currentTimeF"
+Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath started at $currentTimeF"
 
-Get-ApplicableFiles -Files $filesToScan -FolderName $DrivePath
+# Shared state threaded through the recursive walk
+$seenPaths      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$pendingBatch   = @()
+$pendingBatchR  = [ref]$pendingBatch
+$processedCount = [ref]0
 
-$filesToScanUnique = $filesToScan | Sort-Object -Unique
+Walk-AndProcess `
+    -FolderName      $DrivePath `
+    -OutputFile      $filePath `
+    -ProgressFile    $progressFile `
+    -ParallelItems   $ParallelItems `
+    -BatchSize       $BatchSize `
+    -DriveLetter     $DriveLetter `
+    -MappedPath      $MappedPath `
+    -SeenPaths       $seenPaths `
+    -PendingBatch    $pendingBatchR.Value `
+    -PendingBatchRef $pendingBatchR `
+    -ProcessedCount  $processedCount
+
+# Flush any remaining files that didn't fill a complete batch
+if ($pendingBatchR.Value.Count -gt 0) {
+    Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Flushing final batch of $($pendingBatchR.Value.Count) files"
+    Invoke-FlushBatch `
+        -batch          $pendingBatchR.Value `
+        -outputFile     $filePath `
+        -progressFile   $progressFile `
+        -parallelItems  $ParallelItems `
+        -driveLetter    $DriveLetter `
+        -mappedPath     $MappedPath `
+        -processedCount $processedCount
+}
 
 $currentTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Add-ContentSafe -Path $progressFile -Value "Scanning for $DrivePath ended at $currentTimeF — $($filesToScanUnique.Count) unique files found"
+Add-ContentSafe -Path $progressFile -Value "Scanning $DrivePath ended at $currentTimeF — $($processedCount.Value) files processed"
 
-if ($filesToScanUnique.Count -gt 0) {
-    List-FileAgeProperties `
-        -Files         ([System.Collections.ArrayList]$filesToScanUnique) `
-        -Filename      $filePath `
-        -ProgressFile  $progressFile `
-        -ParallelItems $ParallelItems `
-        -BatchSize     $BatchSize `
-        -DriveLetter   $DriveLetter `
-        -MappedPath    $MappedPath
-
-    Write-Host "Listing complete: $filePath"
-}
-else {
-    Write-Host "No files found under $DrivePath"
-}
+Write-Host "Listing complete: $filePath"

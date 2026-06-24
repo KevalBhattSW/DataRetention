@@ -1,47 +1,48 @@
-﻿<#
+<#
 .SYNOPSIS
-    Unzips archived text files, creates a target table, and bulk-loads all
-    pipe-delimited text files (zipped + unzipped) into a single SQL Server table.
+    Stages already-unzipped tab-delimited text files into SQL Server,
+    enriching each row with clean_extension, file_type, date-scope flags,
+    SourceFile, and LoadDateTime.
 
 .DESCRIPTION
     Workflow:
-      1. Unzips any .zip archives found in -ZipFolder into -WorkFolder.
-      2. Copies/uses already-unzipped .txt files from -SourceFolder into -WorkFolder.
-      3. Optionally creates the target table (edit the CREATE TABLE block below
-         to match your real columns before running with -CreateTable).
-      4. Loops over every .txt file in -WorkFolder and BULK INSERTs it into the
-         target table, skipping the header row on each file.
-      5. Logs success/failure per file to a log file and to the console.
-
-.NOTES
-    Auth: Windows Authentication (Trusted_Connection).
-    Delimiter: pipe '|'. Change $FieldTerminator below if yours differs.
-    Row terminator assumed '\n'. Change $RowTerminator if your files use \r\n only
-    or some other line ending (mixed line endings across files are common when
-    files come from different systems — see the note near $RowTerminator below).
+      1. Optionally creates the target and staging tables.
+      2. Copies .txt files from SourceFolder into WorkFolder.
+      3. For each file:
+           a. SqlBulkCopy streams it into the staging table (client-side read,
+              no server-side file access needed).
+           b. A single UPDATE enriches the staging rows.
+           c. INSERT...SELECT moves them into the target table.
+           d. Staging table is truncated ready for the next file.
+      4. Writes a CSV log and summary.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$SqlServer        = "LWUKWVNTV25\INS1,11433",
-    [string]$Database         = "unstrdata",
-    [string]$TargetTable      = "dbo.catalogue_data",
-    [string]$StagingTable      ="dbo.catalogue_data_staging",
+    [string]$SqlServer   = "LWUKWVNTV25\INS1,11433",
+    [string]$Database    = "unstrdata",
+    [string]$TargetTable = "dbo.catalogue_data",
+    [string]$StagingTable = "dbo.catalogue_data_staging",
 
-    [string]$SourceFolder     = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing",   # the ~40 already-unzipped .txt files
-    [string]$ZipFolder        = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing\FilelistingZips",     # the ~15 .zip archives
-    [string]$WorkFolder       = "C:\Temp\Work\",            # everything gets staged/unzipped here
-    [string]$LogFile          = "C:\Temp\import_log.csv",
+    [string]$SourceFolder = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing",
+    [string]$ZipFolder    = "C:\Users\BHATTK\RSA Group\Unstructured Data Remediation - PowerBIReports\Tagging\Data\File Listing\FilelistingZips",
+    [string]$WorkFolder   = "C:\Temp\Work\",
+    [string]$LogFile      = "C:\Temp\import_log.csv",
 
-    [switch]$CreateTable= $true,                                    # pass this switch to (re)create the table first
-    [switch]$DropTableIfExists= $true,                               # pass this to DROP the table before creating it
+    [switch]$CreateTable,
+    [switch]$DropTableIfExists,
 
-
-    [char]$Delimiter      = "`t",
-    [int]$BatchSize       = 5000  # rows sent to SQL Server per network round-trip
+    [char]$Delimiter  = "`t",
+    [int]$BatchSize   = 5000
 )
 
 $ErrorActionPreference = "Stop"
+
+# ------------------------------------------------------------------
+# CsvDataReader — reads tab-delimited files client-side for SqlBulkCopy.
+# Appends SourceFile and LoadDateTime as virtual columns so the server
+# never needs to see the file path.
+# ------------------------------------------------------------------
 Add-Type @"
 using System;
 using System.Data;
@@ -58,8 +59,8 @@ public class CsvDataReader : DbDataReader
     private string[]              _current;
     private bool                  _closed;
 
-    private int DataColCount  { get { return _headers.Length; } }
-    public  int RowCount      { get; private set; }
+    private int DataColCount { get { return _headers.Length; } }
+    public  int RowCount     { get; private set; }
 
     public CsvDataReader(string filePath, char delimiter)
     {
@@ -69,15 +70,10 @@ public class CsvDataReader : DbDataReader
         _loadDt     = DateTime.UtcNow;
 
         var headerLine = _reader.ReadLine();
-        _headers = headerLine == null
-            ? new string[0]
-            : headerLine.Split(_delimiter);
+        _headers = headerLine == null ? new string[0] : headerLine.Split(_delimiter);
     }
 
-    public override int FieldCount
-    {
-        get { return _headers.Length + 2; }
-    }
+    public override int FieldCount { get { return _headers.Length + 2; } }
 
     public override bool Read()
     {
@@ -119,10 +115,7 @@ public class CsvDataReader : DbDataReader
         throw new IndexOutOfRangeException(name);
     }
 
-    public override bool IsDBNull(int i)
-    {
-        return GetValue(i) == DBNull.Value;
-    }
+    public override bool IsDBNull(int i)   { return GetValue(i) == DBNull.Value; }
 
     public override int GetValues(object[] values)
     {
@@ -131,27 +124,27 @@ public class CsvDataReader : DbDataReader
         return n;
     }
 
-    public override void Close()         { _closed = true; _reader.Dispose(); }
-    public override bool IsClosed        { get { return _closed; } }
-    public override int  Depth           { get { return 0; } }
-    public override int  RecordsAffected { get { return -1; } }
-    public override bool HasRows         { get { return true; } }
-    public override bool NextResult()    { return false; }
+    public override void Close()          { _closed = true; _reader.Dispose(); }
+    public override bool IsClosed         { get { return _closed; } }
+    public override int  Depth            { get { return 0; } }
+    public override int  RecordsAffected  { get { return -1; } }
+    public override bool HasRows          { get { return true; } }
+    public override bool NextResult()     { return false; }
 
-    public override bool    GetBoolean(int i)  { return Convert.ToBoolean(GetValue(i)); }
-    public override byte    GetByte(int i)     { return Convert.ToByte(GetValue(i)); }
-    public override char    GetChar(int i)     { return Convert.ToChar(GetValue(i)); }
-    public override Guid    GetGuid(int i)     { return Guid.Parse(GetValue(i).ToString()); }
-    public override short   GetInt16(int i)    { return Convert.ToInt16(GetValue(i)); }
-    public override int     GetInt32(int i)    { return Convert.ToInt32(GetValue(i)); }
-    public override long    GetInt64(int i)    { return Convert.ToInt64(GetValue(i)); }
-    public override float   GetFloat(int i)    { return Convert.ToSingle(GetValue(i)); }
-    public override double  GetDouble(int i)   { return Convert.ToDouble(GetValue(i)); }
-    public override decimal GetDecimal(int i)  { return Convert.ToDecimal(GetValue(i)); }
-    public override DateTime GetDateTime(int i){ return Convert.ToDateTime(GetValue(i)); }
-    public override string  GetString(int i)   { return IsDBNull(i) ? null : GetValue(i).ToString(); }
-    public override string  GetDataTypeName(int i) { return "nvarchar"; }
-    public override Type    GetFieldType(int i)    { return typeof(string); }
+    public override bool     GetBoolean(int i)  { return Convert.ToBoolean(GetValue(i)); }
+    public override byte     GetByte(int i)     { return Convert.ToByte(GetValue(i)); }
+    public override char     GetChar(int i)     { return Convert.ToChar(GetValue(i)); }
+    public override Guid     GetGuid(int i)     { return Guid.Parse(GetValue(i).ToString()); }
+    public override short    GetInt16(int i)    { return Convert.ToInt16(GetValue(i)); }
+    public override int      GetInt32(int i)    { return Convert.ToInt32(GetValue(i)); }
+    public override long     GetInt64(int i)    { return Convert.ToInt64(GetValue(i)); }
+    public override float    GetFloat(int i)    { return Convert.ToSingle(GetValue(i)); }
+    public override double   GetDouble(int i)   { return Convert.ToDouble(GetValue(i)); }
+    public override decimal  GetDecimal(int i)  { return Convert.ToDecimal(GetValue(i)); }
+    public override DateTime GetDateTime(int i) { return Convert.ToDateTime(GetValue(i)); }
+    public override string   GetString(int i)   { return IsDBNull(i) ? null : GetValue(i).ToString(); }
+    public override string   GetDataTypeName(int i) { return "nvarchar"; }
+    public override Type     GetFieldType(int i)    { return typeof(string); }
 
     public override long GetBytes(int i, long fo, byte[] buf, int bo, int len) { return 0; }
     public override long GetChars(int i, long fo, char[] buf, int bo, int len) { return 0; }
@@ -165,6 +158,7 @@ public class CsvDataReader : DbDataReader
     public override object this[string n] { get { return GetValue(GetOrdinal(n)); } }
 }
 "@ -ReferencedAssemblies "System.Data", "System.Xml"
+
 # ------------------------------------------------------------------
 # 0. Setup
 # ------------------------------------------------------------------
@@ -182,13 +176,11 @@ function Invoke-Sql {
     try {
         $conn.Open()
         $cmd = $conn.CreateCommand()
-        $cmd.CommandText = $Query
+        $cmd.CommandText    = $Query
         $cmd.CommandTimeout = $TimeoutSeconds
         $cmd.ExecuteNonQuery() | Out-Null
     }
-    finally {
-        $conn.Close()
-    }
+    finally { $conn.Close() }
 }
 
 $logEntries = New-Object System.Collections.Generic.List[object]
@@ -207,95 +199,68 @@ function Write-LogEntry {
 }
 
 # ------------------------------------------------------------------
-# 1. Unzip archives into the work folder
-# ------------------------------------------------------------------
-Write-Host "`n=== Step 1: Unzipping archives ===" -ForegroundColor Cyan
-<#
-$zipFiles = Get-ChildItem -Path $ZipFolder -Filter "*.zip" -File -ErrorAction SilentlyContinue
-foreach ($zip in $zipFiles) {
-    try {
-        Write-Host "Extracting $($zip.Name)..."
-        Expand-Archive -Path $zip.FullName -DestinationPath $WorkFolder -Force
-        Write-LogEntry -File $zip.Name -Status "SUCCESS" -Detail "Unzipped"
-    }
-    catch {
-        Write-LogEntry -File $zip.Name -Status "FAILED" -Detail "Unzip error: $($_.Exception.Message)"
-    }
-}
-#>
-
-# ------------------------------------------------------------------
-# 3. Create the target table (edit columns to match your real data!)
+# 1. Create tables
+# Note: staging table uses NVARCHAR for all columns so SqlBulkCopy
+#       can push raw strings in without type conversion errors.
+#       combined_date_scope columns are BIT in the target but derived
+#       via CAST in the INSERT...SELECT, not stored as strings.
 # ------------------------------------------------------------------
 if ($CreateTable) {
-    Write-Host "`n=== Step 2: Creating target table ===" -ForegroundColor Cyan
+    Write-Host "`n=== Step 1: Creating tables ===" -ForegroundColor Cyan
 
     if ($DropTableIfExists) {
-        Invoke-Sql -Query "IF OBJECT_ID('$TargetTable', 'U') IS NOT NULL DROP TABLE $TargetTable;"
+        Invoke-Sql -Query "IF OBJECT_ID('$TargetTable',  'U') IS NOT NULL DROP TABLE $TargetTable;"
+        Invoke-Sql -Query "IF OBJECT_ID('$StagingTable', 'U') IS NOT NULL DROP TABLE $StagingTable;"
     }
 
-    # >>> EDIT THIS to match your actual file columns/types <<<
-    # Tip: run Get-Content on one file's first line to see your real column names:
-    #   Get-Content (Get-ChildItem $WorkFolder -Filter *.txt | Select -First 1).FullName -Head 1
-    $createTableSql = @"
+    $createSql = @"
 IF OBJECT_ID('$TargetTable', 'U') IS NULL
 BEGIN
     CREATE TABLE $TargetTable (
-        Name         NVARCHAR(500)   NULL,
-        [Containing Path Size]         NVARCHAR(255)   NULL,
-        [Last Modified]         NVARCHAR(255)   NULL,
-        [Last Accessed]         NVARCHAR(255)   NULL,
-        [Creation Date]         NVARCHAR(255)   NULL,
-        [Extension]         NVARCHAR(255)   NULL,
-        [Last Save Date]         NVARCHAR(255)   NULL,
-        [Date Checked]         NVARCHAR(255)   NULL,
-        -- add/remove columns here to match your files, in file column order --
-        clean_extension nvarchar(255) null,
-        file_type nvarchar(255) null,
-        combined_date_scope bit,
-        combined_date_scope_2026 bit,
-        SourceFile      NVARCHAR(260)   NULL,
-        LoadDateTime    DATETIME2       NOT NULL DEFAULT SYSDATETIME(),
-        Id              INT IDENTITY(1,1) PRIMARY KEY CLUSTERED
-
+        Id                       INT           IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+        [Name]                   NVARCHAR(500) NULL,
+        [Containing Path]        NVARCHAR(255) NULL,
+        [Size]                   NVARCHAR(50)  NULL,
+        [Last Modified]          NVARCHAR(255) NULL,
+        [Last Accessed]          NVARCHAR(255) NULL,
+        [Creation Date]          NVARCHAR(255) NULL,
+        [Extension]              NVARCHAR(255) NULL,
+        [Last Save Date]         NVARCHAR(255) NULL,
+        [Date Checked]           NVARCHAR(255) NULL,
+        clean_extension          NVARCHAR(255) NULL,
+        file_type                NVARCHAR(255) NULL,
+        combined_date_scope      BIT           NULL,
+        combined_date_scope_2026 BIT           NULL,
+        SourceFile               NVARCHAR(260) NULL,
+        LoadDateTime             DATETIME2     NOT NULL DEFAULT SYSDATETIME()
     );
 END
 
 IF OBJECT_ID('$StagingTable', 'U') IS NULL
 BEGIN
     CREATE TABLE $StagingTable (
-        Name         NVARCHAR(500)   NULL,
-        [Containing Path Size]         NVARCHAR(255)   NULL,
-        [Last Modified]         NVARCHAR(255)   NULL,
-        [Last Accessed]         NVARCHAR(255)   NULL,
-        [Creation Date]         NVARCHAR(255)   NULL,
-        [Extension]         NVARCHAR(255)   NULL,
-        [Last Save Date]         NVARCHAR(255)   NULL,
-        [Date Checked]         NVARCHAR(255)   NULL,
-        -- add/remove columns here to match your files, in file column order --
-        clean_extension nvarchar(255) null,
-        file_type nvarchar(255) null,
-        combined_date_scope NVARCHAR(260),
-        combined_date_scope_2026 NVARCHAR(260),
-        SourceFile      NVARCHAR(260)   NULL,
-        LoadDateTime    NVARCHAR(260)       NOT NULL DEFAULT SYSDATETIME()
-
+        [Name]           NVARCHAR(500) NULL,
+        [Containing Path] NVARCHAR(255) NULL,
+        [Size]           NVARCHAR(50)  NULL,
+        [Last Modified]  NVARCHAR(255) NULL,
+        [Last Accessed]  NVARCHAR(255) NULL,
+        [Creation Date]  NVARCHAR(255) NULL,
+        [Extension]      NVARCHAR(255) NULL,
+        [Last Save Date] NVARCHAR(255) NULL,
+        [Date Checked]   NVARCHAR(255) NULL,
+        SourceFile       NVARCHAR(260) NULL,
+        LoadDateTime     NVARCHAR(50)  NULL
     );
 END
 "@
-    Invoke-Sql -Query $createTableSql
-    Write-Host "Table $TargetTable ready." -ForegroundColor Green
+    Invoke-Sql -Query $createSql
+    Write-Host "  Tables ready." -ForegroundColor Green
 }
 
 # ------------------------------------------------------------------
-# 2. Stage the already-unzipped .txt files into the work folder too,
-#    so step 4 only has to loop over one location.
+# 2. Stage already-unzipped files into WorkFolder
 # ------------------------------------------------------------------
-
-
-
-
-Write-Host "`n=== Step 3: Staging already-unzipped files ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 2: Staging files ===" -ForegroundColor Cyan
 
 $plainFiles = Get-ChildItem -Path $SourceFolder -Filter "*.txt" -File -ErrorAction SilentlyContinue
 foreach ($f in $plainFiles) {
@@ -303,207 +268,140 @@ foreach ($f in $plainFiles) {
     if (-not (Test-Path $dest)) {
         Copy-Item -Path $f.FullName -Destination $dest
     }
-
-
+}
+Write-Host "  $($plainFiles.Count) file(s) staged."
 
 # ------------------------------------------------------------------
-# 4. SqlBulkCopy loop
-#
-#    How it works:
-#      - Opens each file as a StreamReader and wraps it in a
-#        lightweight IDataReader shim (CsvDataReader class below).
-#      - SqlBulkCopy streams the rows from that reader directly over
-#        the SQL connection in batches of $BatchSize.
-#      - SourceFile and LoadDateTime are added as extra computed
-#        columns by the reader shim, so they arrive pre-filled
-#        without any server-side staging table.
-#      - The file never needs to be visible to the SQL Server host.
+# 3. Per-file: BulkCopy into staging, enrich, insert into target
 # ------------------------------------------------------------------
-    Write-Host "`n=== Step 4: Loading files via SqlBulkCopy ===" -ForegroundColor Cyan
+Write-Host "`n=== Step 3: Loading files ===" -ForegroundColor Cyan
 
-    # --- CsvDataReader: a minimal IDataReader over a pipe-delimited file ----
-    # Exposes the file's data columns plus two extra columns appended at the end:
-    #   [n-1] SourceFile    — the bare filename
-    #   [n]   LoadDateTime  — current UTC datetime (fixed per file)
+$txtFiles = Get-ChildItem -Path $WorkFolder -Filter "*.txt" -File | Sort-Object Name
 
+foreach ($file in $txtFiles) {
+    $csvReader = $null
+    $bulkCopy  = $null
+    try {
+        # a) Truncate staging ready for this file
+        Invoke-Sql -Query "TRUNCATE TABLE $StagingTable;"
 
-    # --- Load loop -----------------------------------------------------------
-    #$txtFiles = Get-ChildItem -Path $WorkFolder -Filter "*.txt" -File | Sort-Object Name
+        # b) Stream file into staging via SqlBulkCopy
+        $csvReader = New-Object CsvDataReader($file.FullName, $Delimiter)
 
-    #foreach ($file in $txtFiles) {
-        $file = Get-Item -Path $dest
-        $csvReader = $null
-        $bulkCopy  = $null
-        try {
-            $csvReader = New-Object CsvDataReader($file.FullName, $Delimiter)
+        $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy(
+            $connectionString,
+            [System.Data.SqlClient.SqlBulkCopyOptions]::TableLock
+        )
+        $bulkCopy.DestinationTableName = $StagingTable
+        $bulkCopy.BatchSize            = $BatchSize
+        $bulkCopy.BulkCopyTimeout      = 0
 
-            $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy(
-                $connectionString,
-                [System.Data.SqlClient.SqlBulkCopyOptions]::TableLock
-            )
-            $bulkCopy.DestinationTableName = $stagingTable
-            $bulkCopy.BatchSize            = $BatchSize
-            $bulkCopy.BulkCopyTimeout      = 0   # no timeout
+        $bulkCopy.WriteToServer($csvReader)
+        $bulkCopy.Close()
+        $csvReader.Close()
 
-            # Map each column by name so order in the file doesn't need to
-            # exactly match the physical column order in the table.
-            #for ($i = 0; $i -lt $csvReader.FieldCount; $i++) {
-            #    $colName = $csvReader.GetName($i)
-            #    $bulkCopy.ColumnMappings.Add($colName, $colName) | Out-Null
-            #}
+        # c) Enrich staging + insert into target in one SQL batch
+        $enrichSql = @"
+UPDATE $StagingTable
+SET
+    SourceFile   = '$($file.Name)',
+    LoadDateTime = CONVERT(NVARCHAR(50), SYSDATETIME(), 126);
 
-            $bulkCopy.WriteToServer($csvReader)
+INSERT INTO $TargetTable (
+    [Name], [Containing Path], [Size],
+    [Last Modified], [Last Accessed], [Creation Date],
+    [Extension], [Last Save Date], [Date Checked],
+    clean_extension, file_type,
+    combined_date_scope, combined_date_scope_2026,
+    SourceFile, LoadDateTime
+)
+SELECT
+    [Name],
+    [Containing Path],
+    [Size],
+    [Last Modified],
+    [Last Accessed],
+    [Creation Date],
+    [Extension],
+    [Last Save Date],
+    [Date Checked],
+    -- clean_extension
+    CASE
+        WHEN RIGHT(LOWER([Extension]),3) = 'pdf'  THEN '.pdf'
+        WHEN RIGHT(LOWER([Extension]),4) = 'docx' THEN '.docx'
+        WHEN RIGHT(LOWER([Extension]),4) = 'docm' THEN '.docm'
+        WHEN RIGHT(LOWER([Extension]),3) = 'doc'  THEN '.doc'
+        WHEN RIGHT(LOWER([Extension]),4) = 'xlsx' THEN '.xlsx'
+        WHEN RIGHT(LOWER([Extension]),4) = 'xlsm' THEN '.xlsm'
+        WHEN RIGHT(LOWER([Extension]),4) = 'xlsb' THEN '.xlsb'
+        WHEN RIGHT(LOWER([Extension]),3) = 'xls'  THEN '.xls'
+        WHEN RIGHT(LOWER([Extension]),4) = 'pptx' THEN '.pptx'
+        WHEN RIGHT(LOWER([Extension]),4) = 'pptm' THEN '.pptm'
+        WHEN RIGHT(LOWER([Extension]),3) = 'ppt'  THEN '.ppt'
+        ELSE 'Other'
+    END,
+    -- file_type
+    CASE
+        WHEN RIGHT(LOWER([Extension]),4) IN ('docx','docm','xlsx','xlsm','xlsb','pptx','pptm') THEN 'OpenXML'
+        WHEN RIGHT(LOWER([Extension]),3) IN ('doc','xls','ppt')                                THEN 'COM'
+        WHEN RIGHT(LOWER([Extension]),3) = 'pdf'                                               THEN 'PDF'
+        ELSE 'Other'
+    END,
+    -- combined_date_scope
+    CAST(CASE
+        WHEN DATEADD(YEAR,-3,CAST(GETDATE() AS DATE)) > TRY_CAST([Creation Date] AS DATE)
+         AND DATEADD(MONTH,-18,CAST(GETDATE() AS DATE)) > TRY_CAST([Last Accessed] AS DATE)
+        THEN 1 ELSE 0
+    END AS BIT),
+    -- combined_date_scope_2026
+    CAST(CASE
+        WHEN DATEADD(YEAR,-3,DATEFROMPARTS(2026,12,31)) > TRY_CAST([Creation Date] AS DATE)
+         AND DATEADD(MONTH,-18,DATEFROMPARTS(2026,12,31)) > TRY_CAST([Last Accessed] AS DATE)
+        THEN 1 ELSE 0
+    END AS BIT),
+    SourceFile,
+    SYSDATETIME()
+FROM $StagingTable;
 
-            Write-LogEntry -File $file.Name -Status "SUCCESS" `
-                -Detail "Loaded OK" -RowsLoaded $csvReader.RowCount
-
-
-            $bulkInsertSql = @"
-
-            UPDATE $stagingTable
-            SET 
-                clean_extension = 
-                    case 
-                        when right(lower(extension),3) = 'pdf'
-                        then '.pdf'
-                        when right(lower(extension),4) = 'docx'
-                        then '.docx'
-                        when right(lower(extension),4) = 'docm'
-                        then '.docm'
-                        when right(lower(extension),3) = 'doc'
-                        then '.doc'
-                        when right(lower(extension),4) = 'xlsx'
-                        then '.xlsx'
-                        when right(lower(extension),4) = 'xlsm'
-                        then '.xlsm'
-                        when right(lower(extension),4) = 'xlsb'
-                        then '.xlsb'
-                        when right(lower(extension),3) = 'xls'
-                        then '.xls'
-                        when right(lower(extension),4) = 'pptx'
-                        then '.pptx'
-                        when right(lower(extension),4) = 'pptm'
-                        then '.pptm'
-                        when right(lower(extension),3) = 'ppt'
-                        then '.ppt'
-                        else 'Other'
-                    end,
-                file_type = 
-                    case
-                        when right(lower(extension),4) in ('docx','docm','xlsx','xlsm','xlsb','pptx','pptm')
-                        then 'OpenXML'
-                        when right(lower(extension),3) in ('doc','xls','ppt')
-                        then 'COM'
-                        when right(lower(extension),3) in ('pdf')
-                        then 'PDF'
-                        else 'Other'
-                    end,
-                combined_date_scope = 
-                    case
-                        when dateadd(year,-3,cast(getdate() as date)) > cast([Creation Date] as date)
-                            and dateadd(month,-18,cast(getdate() as date)) > cast([Last Accessed] as date)
-                        then 1
-                        else 0
-                    end,
-                combined_date_scope_2026 = 
-                    case
-                        when dateadd(year,-3,datefromparts(2026,12,31)) > cast([Creation Date] as date)
-                            and dateadd(month,-18,datefromparts(2026,12,31)) > cast([Last Accessed] as date)
-                        then 1
-                        else 0
-                    end
-                    ;
-
-
-
-            INSERT INTO $TargetTable([Name]
-,[Containing Path Size]
-,[Last Modified]
-,[Last Accessed]
-,[Creation Date]
-,[Extension]
-,[Last Save Date]
-,[Date Checked]
-,[clean_extension]
-,[file_type]
-,[combined_date_scope]
-,[combined_date_scope_2026]
-,[SourceFile]
-,[LoadDateTime])
-            SELECT [Name]
-,[Containing Path Size]
-,[Last Modified]
-,[Last Accessed]
-,[Creation Date]
-,[Extension]
-,[Last Save Date]
-,[Date Checked]
-,[clean_extension]
-,[file_type]
-,[combined_date_scope]
-,[combined_date_scope_2026]
-,'$($file.Name)'
-,SYSDATETIME()
-            FROM $stagingTable s;
-
-
-            DECLARE @rc INT = (SELECT COUNT(*) FROM $stagingTable);
-            DROP TABLE $stagingTable;
-            SELECT @rc AS RowsLoaded;
+SELECT COUNT(*) FROM $StagingTable;
 "@
-write-host $bulkInsertSql
 
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText    = $enrichSql
+        $cmd.CommandTimeout = 0
+        $reader = $cmd.ExecuteReader()
+        $rows = 0
+        if ($reader.Read()) { $rows = $reader.GetInt32(0) }
+        $reader.Close()
+        $conn.Close()
 
-            try {
-                $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-                $conn.Open()
-                $cmd = $conn.CreateCommand()
-                $cmd.CommandText = $bulkInsertSql
-                $cmd.CommandTimeout = 0
-                $reader = $cmd.ExecuteReader()
-                $rows = 0
-                if ($reader.Read()) { $rows = $reader.GetInt32(0) }
-                $reader.Close()
-                $conn.Close()
-                Remove-Item $file.FullName
-
-                Write-LogEntry -File $file.Name -Status "SUCCESS" -Detail "Loaded OK" -RowsLoaded $rows
-            }
-            catch {
-                Write-LogEntry -File $file.Name -Status "FAILED" -Detail $_.Exception.Message
-            }
-
-        }
-        catch {
-            Write-LogEntry -File $file.Name -Status "FAILED" `
-                -Detail $_.Exception.Message
-        }
-        finally {
-            if ($bulkCopy)  { $bulkCopy.Close() }
-            if ($csvReader) { $csvReader.Close() }
-        }
+        Write-LogEntry -File $file.Name -Status "SUCCESS" -Detail "Loaded OK" -RowsLoaded $rows
     }
-
-    #}
-#}
-
+    catch {
+        Write-LogEntry -File $file.Name -Status "FAILED" -Detail $_.Exception.Message
+    }
+    finally {
+        if ($bulkCopy  -and -not $bulkCopy.GetType().GetMethod('IsClosed')) { try { $bulkCopy.Close()  } catch {} }
+        if ($csvReader -and -not $csvReader.IsClosed)                       { try { $csvReader.Close() } catch {} }
+    }
+}
 
 # ------------------------------------------------------------------
-# 5. Write log and print summary
+# 4. Log and summary
 # ------------------------------------------------------------------
 $logEntries | Export-Csv -Path $LogFile -NoTypeInformation -Encoding UTF8
 
 $successCount = ($logEntries | Where-Object Status -eq "SUCCESS").Count
 $failCount    = ($logEntries | Where-Object Status -eq "FAILED").Count
-$totalRows    = ($logEntries |
-    Where-Object Status -eq "SUCCESS" |
-    Measure-Object -Property RowsLoaded -Sum).Sum
+$totalRows    = ($logEntries | Where-Object Status -eq "SUCCESS" | Measure-Object -Property RowsLoaded -Sum).Sum
 
 Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-Write-Host "Succeeded : $successCount" -ForegroundColor Green
-Write-Host "Failed    : $failCount" -ForegroundColor $(if ($failCount -gt 0) {"Red"} else {"Green"})
-Write-Host "Total rows: $totalRows"
-Write-Host "Log       : $LogFile"
+Write-Host "  Succeeded : $successCount" -ForegroundColor Green
+Write-Host "  Failed    : $failCount"    -ForegroundColor $(if ($failCount -gt 0) {"Red"} else {"Green"})
+Write-Host "  Total rows: $totalRows"
+Write-Host "  Log       : $LogFile"
 
 if ($failCount -gt 0) {
     Write-Host "`n  Review $LogFile for details on failed files." -ForegroundColor Yellow

@@ -8,6 +8,634 @@ if(-not(Test-Path -LiteralPath $DrivePath -PathType Container)) {
     Exit 1
 }
 
+function Test-LegacyOfficeProtectionDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $log = "$($env:LOCALAPPDATA)\Temp\LegacyProtectionDebug.txt"
+
+    $result = [PSCustomObject]@{
+        Path               = $Path
+        IsPasswordToOpen   = $false
+        IsPasswordToModify = $false
+        IsProtected        = $false
+        Reason             = "NoProtection"
+    }
+
+    Add-Content $log "=== Testing: $Path ==="
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = "FileNotFound"
+        Add-Content $log "RESULT: FileNotFound"
+        return $result
+    }
+
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        $br = New-Object System.IO.BinaryReader($fs)
+
+        $header = $br.ReadBytes(8)
+        $oleSig = [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
+        if (($header -join ',') -ne ($oleSig -join ',')) {
+            $result.Reason = "NotOLE"
+            Add-Content $log "RESULT: NotOLE - header bytes: $($header -join ',')"
+            $fs.Close()
+            return $result
+        }
+        Add-Content $log "OLE signature confirmed"
+
+        $fs.Position = 0x1E
+        $sectorShift = $br.ReadInt16()
+        $sectorSize  = [int][math]::Pow(2, $sectorShift)
+        Add-Content $log "SectorShift=$sectorShift  SectorSize=$sectorSize"
+
+        $fs.Position = 0x38
+        $miniSectorCutoff = $br.ReadInt32()
+        Add-Content $log "MiniSectorCutoff=$miniSectorCutoff"
+
+        $fs.Position = 0x30
+        $dirStartSector = $br.ReadInt32()
+        Add-Content $log "DirStartSector=$dirStartSector"
+
+        $fs.Position = 0x2C
+        $fatSectorCount = $br.ReadInt32()
+        Add-Content $log "FatSectorCount=$fatSectorCount"
+
+        $fatSectorList = @()
+        $fs.Position = 0x4C
+        for ($i = 0; $i -lt [math]::Min(109, $fatSectorCount); $i++) {
+            $sec = $br.ReadInt32()
+            if ($sec -ge 0) { $fatSectorList += $sec }
+        }
+        Add-Content $log "FAT sectors found: $($fatSectorList.Count) -> $($fatSectorList -join ',')"
+
+        $fatData = New-Object System.Collections.Generic.List[int]
+        foreach ($fatSec in $fatSectorList) {
+            $fs.Position = ($fatSec + 1) * $sectorSize
+            $entriesPerSector = $sectorSize / 4
+            for ($i = 0; $i -lt $entriesPerSector; $i++) {
+                $fatData.Add($br.ReadInt32())
+            }
+        }
+        Add-Content $log "FAT entries loaded: $($fatData.Count)"
+
+        $streamNames = @{}
+        $sector  = $dirStartSector
+        $visited = @{}
+
+        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 -and -not $visited.ContainsKey($sector)) {
+            $visited[$sector] = $true
+            $fs.Position = ($sector + 1) * $sectorSize
+            $dirBytes    = $br.ReadBytes($sectorSize)
+            $entryCount  = $sectorSize / 128
+
+            for ($e = 0; $e -lt $entryCount; $e++) {
+                $offset    = $e * 128
+                $nameLen   = [System.BitConverter]::ToInt16($dirBytes, $offset + 64)
+                $entryType = $dirBytes[$offset + 66]
+
+                if ($entryType -gt 0 -and $nameLen -gt 0) {
+                    $nameBytes  = $dirBytes[$offset..($offset + $nameLen - 1)]
+                    $name       = [System.Text.Encoding]::Unicode.GetString($nameBytes).TrimEnd([char]0)
+                    $streamSize = [int64][System.BitConverter]::ToUInt32($dirBytes, $offset + 120)
+                    $startSec   = [System.BitConverter]::ToInt32($dirBytes, $offset + 116)
+                    $streamNames[$name] = [PSCustomObject]@{ Size = $streamSize; Start = $startSec; Type = $entryType }
+                    Add-Content $log "  Stream: '$name'  Type=$entryType  Start=$startSec  Size=$streamSize"
+                }
+            }
+
+            if ($sector -lt $fatData.Count) {
+                $sector = $fatData[$sector]
+            } else {
+                break
+            }
+        }
+
+        $fs.Close()
+
+        Add-Content $log "All stream names: $($streamNames.Keys -join ', ')"
+
+        if ($streamNames.ContainsKey("EncryptedPackage") -or $streamNames.ContainsKey("EncryptionInfo")) {
+            $result.IsPasswordToOpen = $true
+            $result.IsProtected      = $true
+            $result.Reason           = "EncryptedToOpen"
+            Add-Content $log "RESULT: EncryptedToOpen"
+            return $result
+        }
+
+        $extension = [System.IO.Path]::GetExtension($Path).ToLower()
+        Add-Content $log "Extension: $extension  Checking write-reservation..."
+
+        switch ($extension) {
+
+            ".doc" {
+                if ($streamNames.ContainsKey("WordDocument")) {
+                    $si  = $streamNames["WordDocument"]
+                    Add-Content $log "WordDocument stream: Start=$($si.Start) Size=$($si.Size)"
+                    $raw = Read-OleStream -Path $Path -StartSector $si.Start -Size $si.Size -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Add-Content $log "WordDocument raw bytes returned: $(if ($null -eq $raw) { 'NULL' } else { $raw.Length })"
+                    if ($raw -ne $null -and $raw.Length -ge 12) {
+                        $fibFlags = [System.BitConverter]::ToUInt16($raw, 10)
+                        Add-Content $log "FIB flags word (offset 10): 0x$('{0:X4}' -f $fibFlags)  fWriteReservation bit (0x0080): $(($fibFlags -band 0x0080) -ne 0)"
+                        if ($fibFlags -band 0x0080) {
+                            $result.IsPasswordToModify = $true
+                            $result.IsProtected        = $true
+                            $result.Reason             = "WriteReservedDoc"
+                        }
+                    } else {
+                        Add-Content $log "WARNING: WordDocument stream too short or null"
+                    }
+                } else {
+                    Add-Content $log "WARNING: WordDocument stream not found in directory"
+                }
+            }
+
+            ".xls" {
+                $streamName = if ($streamNames.ContainsKey("Workbook")) { "Workbook" } else { "Book" }
+                Add-Content $log "Using XLS stream name: '$streamName'  Found=$($streamNames.ContainsKey($streamName))"
+                if ($streamNames.ContainsKey($streamName)) {
+                    $si  = $streamNames[$streamName]
+                    Add-Content $log "Stream: Start=$($si.Start) Size=$($si.Size)"
+                    $raw = Read-OleStream -Path $Path -StartSector $si.Start -Size $si.Size -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Add-Content $log "Raw bytes returned: $(if ($null -eq $raw) { 'NULL' } else { $raw.Length })"
+                    if ($raw -ne $null) {
+                        $i = 0
+                        while ($i -lt ($raw.Length - 4)) {
+                            $recType = [System.BitConverter]::ToUInt16($raw, $i)
+                            $recLen  = [System.BitConverter]::ToUInt16($raw, $i + 2)
+                            if ($recType -eq 0x002F) {
+                                Add-Content $log "Found FilePass record (0x002F) at offset $i — PasswordToOpen"
+                                $result.IsPasswordToOpen = $true; $result.IsProtected = $true; $result.Reason = "EncryptedToOpen"
+                                break
+                            }
+                            if ($recType -eq 0x005C -and $recLen -ge 4) {
+                                $pwHash = [System.BitConverter]::ToUInt16($raw, $i + 4 + 2)
+                                Add-Content $log "Found FileSharing record (0x005C) at offset $i — pwHash=0x$('{0:X4}' -f $pwHash)"
+                                if ($pwHash -ne 0) {
+                                    $result.IsPasswordToModify = $true; $result.IsProtected = $true; $result.Reason = "WriteReservedXls"
+                                }
+                            }
+                            $i += 4 + $recLen
+                            if ($recLen -eq 0 -and $recType -eq 0) { break }
+                        }
+                    }
+                }
+            }
+
+            ".ppt" {
+                $validFirstRecTypes = @(0x03E8, 0x0FF0, 0x0FF3, 0x0FF4, 0x07E5, 0x0FA0)
+
+                # Check HeaderToken in Current User mini-stream
+                $rootEntry = $streamNames["Root Entry"]
+                if ($rootEntry -and $rootEntry.Start -ge 0 -and $rootEntry.Start -ne -2) {
+                    $miniBytes = Read-OleStream -Path $Path -StartSector $rootEntry.Start `
+                                                -Size $rootEntry.Size -SectorSize $sectorSize `
+                                                -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    if ($miniBytes -ne $null -and $miniBytes.Length -ge 16) {
+                        $headerToken = [System.BitConverter]::ToUInt32($miniBytes, 12)
+                        Add-Content $log "Current User HeaderToken: 0x$('{0:X8}' -f $headerToken)"
+                        if ($headerToken -eq 0xF3D1C4DF) {
+                            $result.IsPasswordToOpen = $true
+                            $result.IsProtected      = $true
+                            $result.Reason           = "EncryptedToOpen_PPT_CurrentUser"
+                            Add-Content $log "RESULT: Encrypted via HeaderToken"
+                        }
+                    }
+                }
+
+                # Check PowerPoint Document stream first record type
+                if ($streamNames.ContainsKey("PowerPoint Document")) {
+                    $si  = $streamNames["PowerPoint Document"]
+                    Add-Content $log "PPT stream: Start=$($si.Start) Size=$($si.Size)"
+                    $rawFirst = Read-OleStream -Path $Path -StartSector $si.Start -Size ([math]::Min($si.Size, 8)) `
+                                               -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Add-Content $log "PPT first 8 bytes: $(if ($null -eq $rawFirst) { 'NULL' } else { ($rawFirst | ForEach-Object { '{0:X2}' -f $_ }) -join ' ' })"
+                    if ($rawFirst -ne $null -and $rawFirst.Length -ge 8) {
+                        $firstRecType = [System.BitConverter]::ToUInt16($rawFirst, 2)
+                        Add-Content $log "PPT first recType: 0x$('{0:X4}' -f $firstRecType)"
+                        if ($validFirstRecTypes -notcontains $firstRecType) {
+                            $result.IsPasswordToOpen = $true
+                            $result.IsProtected      = $true
+                            $result.Reason           = "EncryptedToOpen_PPT_StreamGarbled"
+                            Add-Content $log "RESULT: Encrypted - first record type 0x$('{0:X4}' -f $firstRecType) is not a valid PPT record"
+                        }
+                    }
+                }
+
+                # Password-to-modify: scan for WriteAccessAtom (0x03EF) only if not encrypted
+                if (-not $result.IsPasswordToOpen -and $streamNames.ContainsKey("PowerPoint Document")) {
+                    $si  = $streamNames["PowerPoint Document"]
+                    $rawFull = Read-OleStream -Path $Path -StartSector $si.Start -Size $si.Size `
+                                              -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Add-Content $log "PPT full stream bytes: $(if ($null -eq $rawFull) { 'NULL' } else { $rawFull.Length })"
+                    if ($rawFull -ne $null) {
+                        $i             = 0
+                        $maxIterations = 10000
+                        $iteration     = 0
+                        while ($i -lt ($rawFull.Length - 8) -and $iteration -lt $maxIterations) {
+                            $iteration++
+                            $recVer  = $rawFull[$i] -band 0x0F
+                            $recType = [System.BitConverter]::ToUInt16($rawFull, $i + 2)
+                            $recLen  = [System.BitConverter]::ToUInt32($rawFull, $i + 4)
+
+                            Add-Content $log "  Iter=$iteration  Offset=$i  recVer=$recVer  recType=0x$('{0:X4}' -f $recType)  recLen=$recLen"
+
+                            if ($recType -eq 0x03EF) {
+                                $flagByte = if (($i + 8) -lt $rawFull.Length) { $rawFull[$i + 8] } else { 0 }
+                                Add-Content $log "Found WriteAccessAtom at offset $i - flagByte=$flagByte"
+                                if ($flagByte -eq 0x01) {
+                                    $result.IsPasswordToModify = $true
+                                    $result.IsProtected        = $true
+                                    $result.Reason             = "WriteReservedPpt"
+                                }
+                                break
+                            }
+
+                            if ($recVer -eq 0x0F) {
+                                $i += 8
+                            } else {
+                                if ($recLen -gt ($rawFull.Length - $i - 8)) { 
+                                    Add-Content $log "  Overrun guard triggered at offset $i"
+                                    break 
+                                }
+                                $i += 8 + [int]$recLen
+                            }
+                        }
+                        Add-Content $log "PPT write-reservation scan complete: iterations=$iteration  finalOffset=$i"
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $result.Reason = "ReadError: $($_.Exception.Message)"
+        Add-Content $log "EXCEPTION: $($_.Exception.Message)"
+        Add-Content $log $_.ScriptStackTrace
+    }
+
+    Add-Content $log "FINAL RESULT: IsPasswordToOpen=$($result.IsPasswordToOpen)  IsPasswordToModify=$($result.IsPasswordToModify)  Reason=$($result.Reason)"
+    Add-Content $log ""
+    return $result
+}
+
+function Test-LegacyOfficeProtection {
+    <#
+    .SYNOPSIS
+        Detects password-to-open AND password-to-modify in legacy OLE binary Office files
+        (.doc, .xls, .ppt) without opening the file in any Office application.
+    .OUTPUTS
+        [PSCustomObject] with:
+          .IsPasswordToOpen   [bool]
+          .IsPasswordToModify [bool]
+          .IsProtected        [bool]  (either of the above)
+          .Reason             [string]
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $result = [PSCustomObject]@{
+        Path              = $Path
+        IsPasswordToOpen   = $false
+        IsPasswordToModify = $false
+        IsProtected        = $false
+        Reason             = "NoProtection"
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = "FileNotFound"
+        return $result
+    }
+
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        $br = New-Object System.IO.BinaryReader($fs)
+
+        # Verify OLE signature
+        $header = $br.ReadBytes(8)
+        $oleSig = [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
+        if (($header -join ',') -ne ($oleSig -join ',')) {
+            $result.Reason = "NotOLE"
+            $fs.Close()
+            return $result
+        }
+
+        # Sector size (power-of-two exponent at offset 0x1E)
+        $fs.Position = 0x1E
+        $sectorShift = $br.ReadInt16()
+        $sectorSize  = [int][math]::Pow(2, $sectorShift)
+
+        # Mini-stream cutoff at offset 0x38
+        $fs.Position = 0x38
+        $miniSectorCutoff = $br.ReadInt32()
+
+        # Directory sector start at offset 0x30
+        $fs.Position = 0x30
+        $dirStartSector = $br.ReadInt32()
+
+        # FAT sector count and first FAT sector location
+        $fs.Position = 0x2C
+        $fatSectorCount = $br.ReadInt32()
+        $fs.Position = 0x4C
+        $firstFatSector = $br.ReadInt32()
+
+        # Build FAT chain (read all FAT sectors)
+        $fat = New-Object int[] ($fatSectorCount * ($sectorSize / 4))
+        $fatIndex = 0
+        $fs.Position = 0x4C
+        # Read DIFAT from header (first 109 FAT sector locations at offset 0x4C)
+        $fatSectorList = @()
+        $fs.Position = 0x4C
+        for ($i = 0; $i -lt [math]::Min(109, $fatSectorCount); $i++) {
+            $sec = $br.ReadInt32()
+            if ($sec -ge 0) { $fatSectorList += $sec }
+        }
+
+        $fatData = New-Object System.Collections.Generic.List[int]
+        foreach ($fatSec in $fatSectorList) {
+            $fs.Position = ($fatSec + 1) * $sectorSize
+            $entriesPerSector = $sectorSize / 4
+            for ($i = 0; $i -lt $entriesPerSector; $i++) {
+                $fatData.Add($br.ReadInt32())
+            }
+        }
+
+        # Walk directory sector chain and collect stream names
+        $streamNames = @{}
+        $sector = $dirStartSector
+        $visited = @{}
+
+        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 -and -not $visited.ContainsKey($sector)) {
+            $visited[$sector] = $true
+            $fs.Position = ($sector + 1) * $sectorSize
+
+            $dirBytes = $br.ReadBytes($sectorSize)
+            $entryCount = $sectorSize / 128
+
+            for ($e = 0; $e -lt $entryCount; $e++) {
+                $offset     = $e * 128
+                $nameLen    = [System.BitConverter]::ToInt16($dirBytes, $offset + 64)  # byte length of name
+                $entryType  = $dirBytes[$offset + 66]   # 0=empty, 1=storage, 2=stream, 5=root
+
+                if ($entryType -gt 0 -and $nameLen -gt 0) {
+                    $nameBytes = $dirBytes[$offset..($offset + $nameLen - 1)]
+                    $name      = [System.Text.Encoding]::Unicode.GetString($nameBytes).TrimEnd([char]0)
+                    $streamSize = [int64][System.BitConverter]::ToUInt32($dirBytes, $offset + 120)
+                    $startSec   = [System.BitConverter]::ToInt32($dirBytes, $offset + 116)
+                    $streamNames[$name] = [PSCustomObject]@{ Size = $streamSize; Start = $startSec; Type = $entryType }
+                }
+            }
+
+            # Follow FAT chain to next directory sector
+            if ($sector -lt $fatData.Count) {
+                $sector = $fatData[$sector]
+            } else {
+                break
+            }
+        }
+
+        $fs.Close()
+
+        # ---------------------------------------------------------------
+        # PASSWORD-TO-OPEN detection
+        # ---------------------------------------------------------------
+        # If EncryptedPackage + EncryptionInfo exist, the whole file is encrypted
+        if ($streamNames.ContainsKey("EncryptedPackage") -or $streamNames.ContainsKey("EncryptionInfo")) {
+            $result.IsPasswordToOpen  = $true
+            $result.IsProtected       = $true
+            $result.Reason            = "EncryptedToOpen"
+            return $result
+        }
+
+        # ---------------------------------------------------------------
+        # PASSWORD-TO-MODIFY detection (WriteReservation / WriteProtection)
+        # ---------------------------------------------------------------
+        # Word .doc: the "1Table" or "0Table" stream contains a FIB with wri flag,
+        # but the simplest reliable signal is the WorkBook / WordDocument stream
+        # containing a write-reservation password hash.
+        #
+        # The most portable approach: look for the FilePass record in the
+        # Document Summary stream, OR check known stream names for write protection.
+        #
+        # For .xls: Workbook stream starts with BOF record; FilePass record (0x002F)
+        # near the start means open-password. WRITEACCESS record can contain
+        # write-reservation. Simpler: check for "WriteAccess" password via
+        # the FILEPASS record type 0x05 or via the FileSharing info in the
+        # WorkBook stream header area.
+        #
+        # Practical approach that covers all three apps without full parser:
+        # Read the known primary stream and scan for the write-reservation signature bytes.
+
+        $extension = [System.IO.Path]::GetExtension($Path).ToLower()
+
+        switch ($extension) {
+
+            ".doc" {
+                # WordDocument stream: write reservation is flagged by
+                # FIB.fWriteReservation bit. FIB starts at offset 0 of WordDocument stream.
+                # Flags word is at FIB offset 0x0A (word). Bit 0x0080 = fWriteReservation.
+                $streamName = "WordDocument"
+                if ($streamNames.ContainsKey($streamName)) {
+                    $streamInfo = $streamNames[$streamName]
+                    $rawBytes   = Read-OleStream -Path $Path -StartSector $streamInfo.Start `
+                                                 -Size $streamInfo.Size -SectorSize $sectorSize `
+                                                 -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    if ($rawBytes -ne $null -and $rawBytes.Length -ge 12) {
+                        $fibFlags = [System.BitConverter]::ToUInt16($rawBytes, 10)
+                        if ($fibFlags -band 0x0080) {
+                            $result.IsPasswordToModify = $true
+                            $result.IsProtected        = $true
+                            $result.Reason             = "WriteReservedDoc"
+                        }
+                    }
+                    else {
+                        Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Path WARNING: WordDocument stream returned $(if ($null -eq $rawBytes) { 'null' } else { $rawBytes.Length }) bytes - protection check skipped"
+                    }
+                }
+            }
+
+            ".xls" {
+                # Workbook stream: scan for FilePass (0x002F) record — means open password.
+                # Write reservation: look for FILESHARING record (0x005C).
+                # FILESHARING record: fReadOnlyRecommended (2 bytes) + password hash (2 bytes).
+                # If password hash != 0x0000 at offset +2, write-reserved.
+                $streamName = "Workbook"
+                if (-not $streamNames.ContainsKey($streamName)) { $streamName = "Book" }
+                if ($streamNames.ContainsKey($streamName)) {
+                    $streamInfo = $streamNames[$streamName]
+                    $rawBytes   = Read-OleStream -Path $Path -StartSector $streamInfo.Start `
+                                                 -Size $streamInfo.Size -SectorSize $sectorSize `
+                                                 -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    if ($rawBytes -ne $null) {
+                        $i = 0
+                        while ($i -lt ($rawBytes.Length - 4)) {
+                            $recType = [System.BitConverter]::ToUInt16($rawBytes, $i)
+                            $recLen  = [System.BitConverter]::ToUInt16($rawBytes, $i + 2)
+
+                            if ($recType -eq 0x002F) {
+                                # FilePass = open password
+                                $result.IsPasswordToOpen = $true
+                                $result.IsProtected      = $true
+                                $result.Reason           = "EncryptedToOpen"
+                                break
+                            }
+                            if ($recType -eq 0x005C -and $recLen -ge 4) {
+                                # FileSharing record
+                                $pwHash = [System.BitConverter]::ToUInt16($rawBytes, $i + 4 + 2)
+                                if ($pwHash -ne 0) {
+                                    $result.IsPasswordToModify = $true
+                                    $result.IsProtected        = $true
+                                    $result.Reason             = "WriteReservedXls"
+                                }
+                            }
+
+                            $i += 4 + $recLen
+                            if ($recLen -eq 0) { break }  # safety: avoid infinite loop
+                        }
+                    }
+                }
+            }
+
+            ".ppt" {
+                $validFirstRecTypes = @(0x03E8, 0x0FF0, 0x0FF3, 0x0FF4, 0x07E5, 0x0FA0)
+
+                # Check HeaderToken in Current User mini-stream
+                $rootEntry = $streamNames["Root Entry"]
+                if ($rootEntry -and $rootEntry.Start -ge 0 -and $rootEntry.Start -ne -2) {
+                    $miniBytes = Read-OleStream -Path $Path -StartSector $rootEntry.Start `
+                                                -Size $rootEntry.Size -SectorSize $sectorSize `
+                                                -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    if ($miniBytes -ne $null -and $miniBytes.Length -ge 16) {
+                        $headerToken = [System.BitConverter]::ToUInt32($miniBytes, 12)
+                        if ($headerToken -eq 0xF3D1C4DF) {
+                            $result.IsPasswordToOpen = $true
+                            $result.IsProtected      = $true
+                            $result.Reason           = "EncryptedToOpen_PPT_CurrentUser"
+                        }
+                    }
+                }
+
+                # Check PowerPoint Document stream first record type
+                if ($streamNames.ContainsKey("PowerPoint Document")) {
+                    $si  = $streamNames["PowerPoint Document"]
+                    $rawFirst = Read-OleStream -Path $Path -StartSector $si.Start -Size ([math]::Min($si.Size, 8)) `
+                                               -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    if ($rawFirst -ne $null -and $rawFirst.Length -ge 8) {
+                        $firstRecType = [System.BitConverter]::ToUInt16($rawFirst, 2)
+                        if ($validFirstRecTypes -notcontains $firstRecType) {
+                            $result.IsPasswordToOpen = $true
+                            $result.IsProtected      = $true
+                            $result.Reason           = "EncryptedToOpen_PPT_StreamGarbled"
+                        }
+                    }
+                }
+
+                # Password-to-modify: scan for WriteAccessAtom (0x03EF) only if not encrypted
+                if (-not $result.IsPasswordToOpen -and $streamNames.ContainsKey("PowerPoint Document")) {
+                    $si  = $streamNames["PowerPoint Document"]
+                    $rawFull = Read-OleStream -Path $Path -StartSector $si.Start -Size $si.Size `
+                                              -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    if ($rawFull -ne $null) {
+                        $i             = 0
+                        $maxIterations = 10000
+                        $iteration     = 0
+                        while ($i -lt ($rawFull.Length - 8) -and $iteration -lt $maxIterations) {
+                            $iteration++
+                            $recVer  = $rawFull[$i] -band 0x0F
+                            $recType = [System.BitConverter]::ToUInt16($rawFull, $i + 2)
+                            $recLen  = [System.BitConverter]::ToUInt32($rawFull, $i + 4)
+
+
+                            if ($recType -eq 0x03EF) {
+                                $flagByte = if (($i + 8) -lt $rawFull.Length) { $rawFull[$i + 8] } else { 0 }
+                                if ($flagByte -eq 0x01) {
+                                    $result.IsPasswordToModify = $true
+                                    $result.IsProtected        = $true
+                                    $result.Reason             = "WriteReservedPpt"
+                                }
+                                break
+                            }
+
+                            if ($recVer -eq 0x0F) {
+                                $i += 8
+                            } else {
+                                if ($recLen -gt ($rawFull.Length - $i - 8)) { 
+                                    Add-Content $log "  Overrun guard triggered at offset $i"
+                                    break 
+                                }
+                                $i += 8 + [int]$recLen
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $result.Reason = "ReadError: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+
+function Read-OleStream {
+    <#
+    .SYNOPSIS
+        Reads raw bytes from an OLE stream given its start sector and size.
+        Handles both normal sectors and mini-stream sectors.
+    #>
+    param(
+        [string]$Path,
+        [int]$StartSector,
+        [int64]$Size,
+        [int]$SectorSize,
+        [System.Collections.Generic.List[int]]$Fat,
+        [int]$MiniCutoff
+    )
+
+    # Mini-stream not supported here (streams < MiniCutoff live in root's data).
+    # For the primary document streams (WordDocument, Workbook, PowerPoint Document)
+    # these are always full-sector streams, so this covers all three cases.
+    # Mini-stream support can be added later if needed for edge cases.
+
+    try {
+        $fs     = [System.IO.File]::OpenRead($Path)
+        $br     = New-Object System.IO.BinaryReader($fs)
+        $buffer = New-Object System.Collections.Generic.List[byte]
+
+        $sector    = $StartSector
+        $remaining = $Size
+        $visited   = @{}
+
+        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 -and -not $visited.ContainsKey($sector)) {
+            $visited[$sector] = $true
+            $fs.Position      = ($sector + 1) * $SectorSize
+
+            $toRead = [math]::Min($SectorSize, $remaining)
+            $bytes  = $br.ReadBytes($toRead)
+            $buffer.AddRange($bytes)
+            $remaining -= $toRead
+
+            if ($sector -lt $Fat.Count) {
+                $sector = $Fat[$sector]
+            } else {
+                break
+            }
+        }
+
+        $fs.Close()
+        return $buffer.ToArray()
+    }
+    catch {
+        return $null
+    }
+}
+
 function Set-OfficeDocCustomProperty {
 	[OutputType([boolean])]
 	Param(
@@ -488,46 +1116,44 @@ function Get-OfficeFormat {
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        return [PSCustomObject]@{
-            File   = $Path
-            Format = "NotFound"
-            Type   = "Unknown"
-        }
+        return [PSCustomObject]@{ File = $Path; Format = "NotFound"; Type = "Unknown" }
     }
 
-    # Read first 8 bytes
     $fs = [System.IO.File]::OpenRead($Path)
     $buffer = New-Object byte[] 8
     $fs.Read($buffer, 0, 8) | Out-Null
     $fs.Close()
 
-    # ZIP (PK 03 04) Office Open XML (DOCX/XLSX/PPTX)
-    if ($buffer[0] -eq 0x50 -and $buffer[1] -eq 0x4B -and $buffer[2] -eq 0x03 -and $buffer[3] -eq 0x04) {
-        return [PSCustomObject]@{
-            File   = $Path
-            Format = "OpenXML"
-            Type   = "2007Plus (DOCX/XLSX/PPTX)"
-        }
+    # ZIP signature = OpenXML (unencrypted)
+    if ($buffer[0] -eq 0x50 -and $buffer[1] -eq 0x4B -and
+        $buffer[2] -eq 0x03 -and $buffer[3] -eq 0x04) {
+        return [PSCustomObject]@{ File = $Path; Format = "OpenXML"; Type = "2007Plus (DOCX/XLSX/PPTX)" }
     }
 
-    # OLE Compound File (D0 CF 11 E0 A1 B1 1A E1) Office Binary (DOC/XLS/PPT)
-    if ($buffer[0] -eq 0xD0 -and $buffer[1] -eq 0xCF -and $buffer[2] -eq 0x11 -and 
+    # OLE signature
+    if ($buffer[0] -eq 0xD0 -and $buffer[1] -eq 0xCF -and $buffer[2] -eq 0x11 -and
         $buffer[3] -eq 0xE0 -and $buffer[4] -eq 0xA1 -and $buffer[5] -eq 0xB1 -and
         $buffer[6] -eq 0x1A -and $buffer[7] -eq 0xE1) {
 
-        return [PSCustomObject]@{
-            File   = $Path
-            Format = "BinaryOLE"
-            Type   = "97-2003 (DOC/XLS/PPT)"
+        # Could be a legacy binary file, OR an encrypted OpenXML file.
+        # Encrypted OpenXML is wrapped in OLE with EncryptedPackage + EncryptionInfo streams.
+        # Check the extension to disambiguate — encrypted DOCX/XLSX/PPTX should still
+        # be treated as OpenXML so they get routed to Process-OpenXmlBatch.
+        $ext = [System.IO.Path]::GetExtension($Path).ToLower()
+        $openXmlExtensions = @(".docx", ".docm", ".xlsx", ".xlsm", ".xlsb", ".pptx", ".pptm")
+
+        if ($openXmlExtensions -contains $ext) {
+            return [PSCustomObject]@{
+                File   = $Path
+                Format = "OpenXML"
+                Type   = "2007Plus Encrypted (OLE-wrapped DOCX/XLSX/PPTX)"
+            }
         }
+
+        return [PSCustomObject]@{ File = $Path; Format = "BinaryOLE"; Type = "97-2003 (DOC/XLS/PPT)" }
     }
 
-    # Unknown or corrupted format
-    return [PSCustomObject]@{
-        File   = $Path
-        Format = "Unknown"
-        Type   = "Unrecognized or Corrupt"
-    }
+    return [PSCustomObject]@{ File = $Path; Format = "Unknown"; Type = "Unrecognized or Corrupt" }
 }
 
 function Set-OpenXmlProperties {
@@ -1382,6 +2008,8 @@ function Process-COMBatch {
     $pool.Open()
  
     # Capture all required function definitions once, outside the loop
+    $fnReadOleStream        = "function Read-OleStream { ${function:Read-OleStream} }"
+    $fnTestLegacyProtection = "function Test-LegacyOfficeProtection { ${function:Test-LegacyOfficeProtection} }"
     $fnSetOfficeDoc         = "function Set-OfficeDocCustomProperty { ${function:Set-OfficeDocCustomProperty} }"
     $fnTestEncrypted        = "function Test-OfficeEncrypted { ${function:Test-OfficeEncrypted} }"
     $fnTestEncryptedPpt2003 = "function Test-Ppt2003HasOpenPassword { ${function:Test-Ppt2003HasOpenPassword} }"
@@ -1405,7 +2033,8 @@ function Process-COMBatch {
         $ps.AddScript($fnTestEncrypted)        | Out-Null
         $ps.AddScript($fnTestEncryptedPpt2003) | Out-Null
         $ps.AddScript($fnSetOfficeDoc)         | Out-Null
- 
+        $ps.AddScript($fnReadOleStream)          | Out-Null
+        $ps.AddScript($fnTestLegacyProtection)   | Out-Null 
         $ps.AddScript({
             param(
                 $metadataDuration,
@@ -1427,13 +2056,14 @@ function Process-COMBatch {
             # --- Encryption check ---
             $item = Get-Item -LiteralPath $file   # get item once before the check
  
-            if ($item.Extension -eq ".ppt") {     # -eq not = 
-                $isPasswordProtected = Test-Ppt2003HasOpenPassword -Path $file
-            }
-            else {
-                $isPasswordProtected = (Test-OfficeEncrypted -Path $file).IsEncrypted
-            }
- 
+            # NEW:
+            $protection = Test-LegacyOfficeProtection -Path $file
+            if ($protection.IsPasswordToOpen -or $protection.IsPasswordToModify) {
+                $isPasswordProtected = $true
+                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file skipped — $($protection.Reason)"
+            } else {
+                $isPasswordProtected = $false
+            } 
             $dtLastAccessedDoc = $item.LastAccessTime
             $dtCreated         = $item.CreationTime
             $dtLastModified    = $item.LastWriteTime
@@ -1824,8 +2454,8 @@ function Get-ApplicableFiles {
         # Process files in current folder
         Get-ChildItem -LiteralPath $FolderName -File -ErrorAction Stop |
         Where-Object {
-            $_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
-            $_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
+            #$_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
+            #$_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
             ($officeExtensions -contains $_.Extension.ToLowerInvariant()) -and
             $_.Name.Substring(0,1) -ne '~' -and
             $_.Length -gt 0
@@ -1867,10 +2497,11 @@ function Execute_Tagging() {
 	$FolderName = $DrivePath
 	Write-Host "Folder Name is: $FolderName"
 	# $FolderName = "C:\temp\Labelling"
-    #$targetFolder = ($($FolderName.TrimStart('\').Replace('\','_'))).Replace('C:','_')
+    
+    $targetFolder = ($($FolderName.TrimStart('\').Replace('\','_'))).Replace('C:','_')
 	# Define the file collection location
-	$targetDir = "C:\Temp\Unstructured\$($FolderName.TrimStart('\').Replace('\','_'))"
-    #$targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\$targetFolder"
+	#$targetDir = "C:\Temp\Unstructured\$($FolderName.TrimStart('\').Replace('\','_'))"
+    $targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\$targetFolder"
 	if (!(Test-Path $targetDir -PathType Container)) {
 		New-Item -ItemType Directory -Path $targetDir
 		$newRun = $true

@@ -1,7 +1,11 @@
 ﻿param(
     [Parameter(Mandatory=$true)]
-    [string]$DrivePath
+    [string]$DrivePath,
+    [Parameter(Mandatory=$true)]
+    [string]$ScriptPath
 )
+
+
 
 if(-not(Test-Path -LiteralPath $DrivePath -PathType Container)) {
     Write-Error "DrivePath '$drivePath' does not exist or is not accessible. Aborting."
@@ -1156,6 +1160,7 @@ function Get-OfficeFormat {
     return [PSCustomObject]@{ File = $Path; Format = "Unknown"; Type = "Unrecognized or Corrupt" }
 }
 
+
 function Set-OpenXmlProperties {
     param(
         [Parameter(Mandatory)]
@@ -1411,28 +1416,28 @@ function Update-FileAgeProperties {
         [System.Collections.ArrayList]$Files,
         [string]$processedFiles,
         [string]$skippedFiles,
-        [int]$openXmlParallelItems = 3,
-        [int]$pdfParallelItems     = 3,
-        [int]$comParallelItems     = 2,
+        [int]$openXmlParallelItems = 10,
+        [int]$pdfParallelItems     = 10,
+        [int]$comParallelItems     = 5,
 
-        # Batch trigger thresholds — how many files accumulate in a queue
+        # Batch trigger thresholds   how many files accumulate in a queue
         # before that queue is dispatched as a batch. This is NOT a
         # concurrency control; the *ParallelItems values above still cap
         # how many runspaces execute simultaneously within a batch via
         # CreateRunspacePool(1, $parallelItems). Raising these thresholds
-        # just means fewer, larger dispatch/drain cycles — less pool
-        # open/close overhead — while parallelItems continues to throttle
+        # just means fewer, larger dispatch/drain cycles   less pool
+        # open/close overhead   while parallelItems continues to throttle
         # how many files are actually being worked on at once.
-        [int]$openXmlBatchTrigger = 30,   # was 3
-        [int]$pdfBatchTrigger     = 30,   # was 3
-        [int]$comBatchTrigger     = 20    # was 2
+        [int]$openXmlBatchTrigger = 100,   # was 3
+        [int]$pdfBatchTrigger     = 100,   # was 3
+        [int]$comBatchTrigger     = 30    # was 2
     )
 
     if (!(Test-FileExists -fileToTest $processedFiles)) {
         return
     }
 
-    $debugFile = "$($env:LOCALAPPDATA)\temp\debug.txt"
+    $debugFile = "$($env:LOCALAPPDATA)\$ScriptPath\debug.txt"
     if (!(Test-Path -Path $debugFile -PathType Leaf)) {
         New-Item -Path $debugFile -ItemType File -Force | Out-Null
     }
@@ -1451,7 +1456,7 @@ function Update-FileAgeProperties {
     $openXmlQueue = New-Object System.Collections.ArrayList
     $pdfQueue     = New-Object System.Collections.ArrayList
 
-    # NOTE: $jobs is gone entirely — nothing accumulates across the run any more.
+    # NOTE: $jobs is gone entirely   nothing accumulates across the run any more.
     # Each batch is dispatched and drained (waited on, disposed, pool closed)
     # immediately, in-line, before the foreach loop moves to the next file.
 
@@ -1508,7 +1513,7 @@ function Update-FileAgeProperties {
 
         Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file queued for property update"
 
-        # --- Batch triggers: dispatch, wait, dispose, close pool — all before continuing ---
+        # --- Batch triggers: dispatch, wait, dispose, close pool   all before continuing ---
 
         if ($openXmlQueue.Count -ge $openXmlBatchTrigger) {
             $openXmlQueueCopy = [System.Collections.ArrayList]@($openXmlQueue)
@@ -1622,7 +1627,7 @@ function Update-FileAgeProperties {
 
 # ---------------------------------------------------------------------------
 # Wait-AndCollectJobs
-# Shared helper — waits on every job in a batch result, collects output,
+# Shared helper   waits on every job in a batch result, collects output,
 # disposes each Pipe, then closes and disposes the runspace pool itself.
 # This is what makes the incremental draining above actually free memory:
 # without explicitly closing $BatchResult.Pool, the pool's threads and
@@ -1678,9 +1683,9 @@ function Process-PdfBatch{
     }    
     #Python dependencies for PDF updates
     #$PythonPath = "C:\Program Files\Python313\python.exe"
-    #$ScriptPath = "C:\Temp\update_pdf_properties.py"
+    #$PythonScriptPath = "C:\Temp\update_pdf_properties.py"
     $PythonPath = "C:\Users\UDRTagging\AppData\Local\Python\pythoncore-3.14-64\python.exe"
-    $ScriptPath = "C:\Temp\update_pdf_properties_new.py"
+    $PythonScriptPath = "$ScriptPath\update_pdf_properties_new.py"
 
 
     $pool = [runspacefactory]::CreateRunspacePool(1,$parallelItems)
@@ -1704,7 +1709,7 @@ function Process-PdfBatch{
                 , $format               `
                 , $filePathLog `
                 , $pythonPath `
-                , $scriptPath `
+                , $PythonScriptPath `
                 , $fileToProcess 
             )
 
@@ -1731,7 +1736,7 @@ function Process-PdfBatch{
                 $strProperty3Years =if($blProperty3Years) {"True"} else {"False"}
 
 
-                $result = & $pythonPath $scriptPath $fileToProcess `
+                $result = & $pythonPath $PythonScriptPath $fileToProcess `
                     "OriginalPath=$fileToProcess" `
                     "LastAccessed18Months=$strProperty18Months" `
                     "Created3Years=$strProperty3Years"
@@ -1807,7 +1812,7 @@ function Process-PdfBatch{
         $ps.AddArgument($format)| Out-Null
         $ps.AddArgument($filePathLog)| Out-Null
         $ps.AddArgument($PythonPath)| Out-Null
-        $ps.AddArgument($scriptPath)| Out-Null
+        $ps.AddArgument($PythonScriptPath)| Out-Null
         $ps.AddArgument($fileToProcess)| Out-Null
 
         
@@ -2454,8 +2459,8 @@ function Get-ApplicableFiles {
         # Process files in current folder
         Get-ChildItem -LiteralPath $FolderName -File -ErrorAction Stop |
         Where-Object {
-            #$_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
-            #$_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
+            $_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
+            $_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
             ($officeExtensions -contains $_.Extension.ToLowerInvariant()) -and
             $_.Name.Substring(0,1) -ne '~' -and
             $_.Length -gt 0
@@ -2497,11 +2502,10 @@ function Execute_Tagging() {
 	$FolderName = $DrivePath
 	Write-Host "Folder Name is: $FolderName"
 	# $FolderName = "C:\temp\Labelling"
-    
-    $targetFolder = ($($FolderName.TrimStart('\').Replace('\','_'))).Replace('C:','_')
+    #$targetFolder = ($($FolderName.TrimStart('\').Replace('\','_'))).Replace('C:','_')
 	# Define the file collection location
-	#$targetDir = "C:\Temp\Unstructured\$($FolderName.TrimStart('\').Replace('\','_'))"
-    $targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\$targetFolder"
+	$targetDir = "$ScriptPath\Unstructured\$($FolderName.TrimStart('\').Replace('\','_'))"
+    #$targetDir = "$($env:LOCALAPPDATA)\Temp\Unstructured\$targetFolder"
 	if (!(Test-Path $targetDir -PathType Container)) {
 		New-Item -ItemType Directory -Path $targetDir
 		$newRun = $true
@@ -2528,12 +2532,17 @@ function Execute_Tagging() {
 
 	$filesToScan =[System.Collections.ArrayList]::new()
 	if ($newRun -eq $false) {
-		$targetFilesList = (Get-Content -Path $targetFiles).Trim()
+		$targetFilesList = (Get-Content -Path $targetFiles).Trim() 
+		$skippedFilesList = (Get-Content -Path $skippedFiles).Trim()
+		$skippedFilesListUnique = $skippedFilesList | sort -Unique
 		if((Get-Item $scannedFiles).Length -ne 0) {
 			$scannedFilesList = (Get-Content -Path $scannedFiles).Trim()
 			foreach ($targetFile in $targetFilesList) {
 				if($scannedFilesList.contains($targetFile)) {
-				Write-Host "$targetFile has already been scanned"
+				    Write-Host "$targetFile has already been scanned"
+				}
+                elseif($skippedFilesListUnique.contains($targetFile)) {
+				    Write-Host "$targetFile has been skipped previously"
 				}
 				else {
 					$filesToScan.Add($targetFile)
@@ -2569,7 +2578,7 @@ function Execute_Tagging() {
 		Write-Host "Processing files with Update-FileAgeProperties ... "
 		# Execute the update process on retrieved files
 		try{
-            Update-FileAgeProperties -Files $filesToScanUnique -ProcessedFiles $scannedFiles -SkippedFiles $skippedFiles
+            Update-FileAgeProperties -Files $filesToScanUnique -ProcessedFiles $scannedFiles -skippedFiles $skippedFiles
         }
         catch {
             Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Update-FileAgeProperties failed without warning - $($_.Exception.Message)"
@@ -2600,7 +2609,7 @@ function Start-KillProcessMonitor {
     param(
         [int]$MaxRuntimeSeconds = 60,
         [int]$CheckIntervalSeconds = 15,
-        [string]$LogPath = "C:\temp\KillProcess.log",
+        [string]$LogPath = "$ScriptPath\KillProcess.log",
         [switch]$ShowWindow,   # show a console window
         [switch]$NoExit        # keep it open (for debugging)
     )
@@ -2696,7 +2705,7 @@ function Stop-KillProcessMonitor {
 function Invoke-ExecuteTaggingSafely {
 
     # Start the external monitor process (hidden)
-    $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "C:\temp\KillProcess.log" -ShowWindow -NoExit
+    $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$ScriptPath\KillProcess.log" -ShowWindow -NoExit
     #$monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$($env:LOCALAPPDATA)\Temp\KillProcess.log" -ShowWindow -NoExit
 
     if ($null -eq $monitorProc) {
@@ -2783,3 +2792,35 @@ $check = Set-OpenXmlProperties -FilePath $fileToProcess -Properties @{
 
 Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProcess $($check)"
 #>
+# SIG # Begin signature block
+# MIIFjgYJKoZIhvcNAQcCoIIFfzCCBXsCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
+# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUo94POIZDVbX82kfiko1dbJeg
+# hhGgggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
+# AQsFADAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZzAeFw0y
+# NjA3MDMxMDAyNTVaFw0zMTA3MDMxMDEyNTFaMCUxIzAhBgNVBAMMGlVEUiBUYWdn
+# aW5nIFNjcmlwdCBTaWduaW5nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
+# AQEA0ahFLuBWT8eQYEXp4UNGKqZ+aBrj+Wjn95UOc5E8cm78DK2RGMO88iQHRYsv
+# lc8UwNOZA3VL9CZOdUilRTZfxlHtwpPQP9jdho+ceTOdSRQpznTTe2MKZT1WzQ4R
+# v7dhYKDUAbb7jiSteYtb+L2tR0UPDuFHNekRpG35eq2J+/x96h2ZA+DhM54Mz83g
+# Ie59Cs2T95sYsA+eSbcfRPJdfz2KPmz+DrQHYsgkTveRnOvr36b6vuyiVyBDXQzp
+# CxnDGxTIxdLkJtIyefP0fyCgZgZdKH97GVmdfYjfoYxJ5sN/Hk4flUEjMuMlfTmM
+# mJ40TmwHtOKtkwfeKXsE9SyOsQIDAQABo0YwRDAOBgNVHQ8BAf8EBAMCB4AwEwYD
+# VR0lBAwwCgYIKwYBBQUHAwMwHQYDVR0OBBYEFJ6YYuR91Gg43DzDNPmgIHbPYkoH
+# MA0GCSqGSIb3DQEBCwUAA4IBAQA91UnsH6jMWAdf6URgNeuioWjnW1VcVnf8Rwta
+# BbH6SOi2Ep/ILWGHJr/Y6vTgX5kNasmKlbdF4d9uCKdQMn7VVmIaJyHQXaH4Hxhn
+# tds2kuJ9Jjmc27lx4jCVshlACn53hOhJNJLED0X+kxgedzY6kkS8bZXkMonfDesG
+# CYYnMtVYuf1PinYa3zeUxuZBt6HhD5ny9KDv4R96KrPRzfAkDhHv/o6X0/pCQlF9
+# ms5deEvBGRa0Lx1EkSzP+CyHzC8Ovi/LdjvP6chjA4eYr3DGRt5Nd/pLwShO5dJ/
+# qqW+96CM0MKNB8+7wtVMpMfqDQz1GjzppehQz5qObQOfqjwFMYIB2jCCAdYCAQEw
+# OTAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZwIQE7EWVmkf
+# AJtDYwn54Vq9kjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKA
+# ADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYK
+# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQU5UDiLdd+jqZv/o8SA8PCO78UQuUw
+# DQYJKoZIhvcNAQEBBQAEggEAeMv/y59+L6BHm9oOHylcQokdDh/cgZ/8Lt4UFARq
+# 5zQH6ucHY+wSeteKqQzDDD/Q7rAWfzgO/14OBEQK2LGE1OcfRBPeh7c1w8PltPqY
+# FpXSUBQl8832sCdg8WABlovXCNbJhzc4EFUKwem9pMLdRGaBpEOv1DISTfd7Q1I+
+# b2xjn32KvhRzsGv5GQWdc/j1eTYVlIe9MXvNne8V+esAC9tRFdYs5Sm3Qq1Fc5xW
+# 7xVY+YOh0qX1yjTBA0qe9quTIFl0047Al70FPHKL72lodqSsMHpf5qLh+6n/TN0f
+# zb6Y9ljFeclaG44xZQ2X8Z+tm0hNMUcwKi9LcEFP9W8RuQ==
+# SIG # End signature block

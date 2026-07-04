@@ -328,35 +328,34 @@ function Test-LegacyOfficeProtection {
             return $result
         }
 
-        # Sector size (power-of-two exponent at offset 0x1E)
-        $fs.Position = 0x1E
-        $sectorShift = $br.ReadInt16()
-        $sectorSize  = [int][math]::Pow(2, $sectorShift)
+# Read entire 512-byte header into buffer to avoid BinaryReader seek/buffer desync
+        $header512 = New-Object byte[] 512
+        $fs.Read($header512, 0, 512) | Out-Null
 
-        # Mini-stream cutoff at offset 0x38
-        $fs.Position = 0x38
-        $miniSectorCutoff = $br.ReadInt32()
+        $sectorShift      = [System.BitConverter]::ToInt16($header512, 0x1E)
+        $sectorSize       = [int][math]::Pow(2, $sectorShift)
+        $miniSectorCutoff = [System.BitConverter]::ToInt32($header512, 0x38)
+        $dirStartSector   = [System.BitConverter]::ToInt32($header512, 0x30)
+        $fatSectorCount   = [System.BitConverter]::ToInt32($header512, 0x2C)
 
-        # Directory sector start at offset 0x30
-        $fs.Position = 0x30
-        $dirStartSector = $br.ReadInt32()
-
-        # FAT sector count and first FAT sector location
-        $fs.Position = 0x2C
-        $fatSectorCount = $br.ReadInt32()
-        $fs.Position = 0x4C
-        $firstFatSector = $br.ReadInt32()
-
-        # Build FAT chain (read all FAT sectors)
-        $fat = New-Object int[] ($fatSectorCount * ($sectorSize / 4))
-        $fatIndex = 0
-        $fs.Position = 0x4C
-        # Read DIFAT from header (first 109 FAT sector locations at offset 0x4C)
         $fatSectorList = @()
-        $fs.Position = 0x4C
         for ($i = 0; $i -lt [math]::Min(109, $fatSectorCount); $i++) {
-            $sec = $br.ReadInt32()
+            $sec = [System.BitConverter]::ToInt32($header512, 0x4C + ($i * 4))
             if ($sec -ge 0) { $fatSectorList += $sec }
+        }
+        $fs.Close()
+
+        # Re-open for FAT and directory reads
+        $fs = [System.IO.File]::OpenRead($Path)
+        $br = New-Object System.IO.BinaryReader($fs)
+
+        $fatData = New-Object System.Collections.Generic.List[int]
+        foreach ($fatSec in $fatSectorList) {
+            $fs.Position = ($fatSec + 1) * $sectorSize
+            $entriesPerSector = $sectorSize / 4
+            for ($i = 0; $i -lt $entriesPerSector; $i++) {
+                $fatData.Add($br.ReadInt32())
+            }
         }
 
         $fatData = New-Object System.Collections.Generic.List[int]
@@ -498,7 +497,7 @@ function Test-LegacyOfficeProtection {
                             }
 
                             $i += 4 + $recLen
-                            if ($recLen -eq 0) { break }  # safety: avoid infinite loop
+                            if ($recLen -eq 0 -and $recType -eq 0) { break }  # safety: avoid infinite loop
                         }
                     }
                 }

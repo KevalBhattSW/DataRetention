@@ -335,7 +335,7 @@ function Test-LegacyOfficeProtection {
         }
 
         $oleSig = [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
-        if (($header -join ',') -ne ($oleSig -join ',')) {
+        if (($header512[0..7] -join ',') -ne ($oleSig -join ',')) {
             $result.Reason = "NotOLE"
             $fs.Close()
             return $result
@@ -353,21 +353,10 @@ function Test-LegacyOfficeProtection {
             $sec = [System.BitConverter]::ToInt32($header512, 0x4C + ($i * 4))
             if ($sec -ge 0) { $fatSectorList += $sec }
         }
-        $fs.Close()
-
         # Re-open for FAT and directory reads
         $fs = [System.IO.File]::OpenRead($Path)
         $br = New-Object System.IO.BinaryReader($fs)
         try{
-        $fatData = New-Object System.Collections.Generic.List[int]
-            foreach ($fatSec in $fatSectorList) {
-                $fs.Position = ($fatSec + 1) * $sectorSize
-                $entriesPerSector = $sectorSize / 4
-                for ($i = 0; $i -lt $entriesPerSector; $i++) {
-                    $fatData.Add($br.ReadInt32())
-                }
-            }
-
             $fatData = New-Object System.Collections.Generic.List[int]
             foreach ($fatSec in $fatSectorList) {
                 $fs.Position = ($fatSec + 1) * $sectorSize

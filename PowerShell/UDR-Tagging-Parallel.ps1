@@ -317,10 +317,23 @@ function Test-LegacyOfficeProtection {
 
     try {
         $fs = [System.IO.File]::OpenRead($Path)
+
+<#
         $br = New-Object System.IO.BinaryReader($fs)
 
         # Verify OLE signature
         $header = $br.ReadBytes(8)
+#>
+        try{
+            #Read entire 512-byte header into bugger to avoid BinaryReader seek/buffer desync
+            $header512 = New-Object byte[] 512
+            $fs.Read($header512, 0, 512) | Out-Null
+        }
+        finally {
+            $fs.Close()
+            $fs.Dispose()
+        }
+
         $oleSig = [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
         if (($header -join ',') -ne ($oleSig -join ',')) {
             $result.Reason = "NotOLE"
@@ -328,12 +341,9 @@ function Test-LegacyOfficeProtection {
             return $result
         }
 
-# Read entire 512-byte header into buffer to avoid BinaryReader seek/buffer desync
-        $header512 = New-Object byte[] 512
-        $fs.Read($header512, 0, 512) | Out-Null
 
-        $sectorShift      = [System.BitConverter]::ToInt16($header512, 0x1E)
-        $sectorSize       = [int][math]::Pow(2, $sectorShift)
+        $sectorShift = [System.BitConverter]::ToInt16($header512,0x1E)
+        $sectorSize = [int][math]::Pow(2, $sectorShift)
         $miniSectorCutoff = [System.BitConverter]::ToInt32($header512, 0x38)
         $dirStartSector   = [System.BitConverter]::ToInt32($header512, 0x30)
         $fatSectorCount   = [System.BitConverter]::ToInt32($header512, 0x2C)
@@ -348,61 +358,66 @@ function Test-LegacyOfficeProtection {
         # Re-open for FAT and directory reads
         $fs = [System.IO.File]::OpenRead($Path)
         $br = New-Object System.IO.BinaryReader($fs)
-
+        try{
         $fatData = New-Object System.Collections.Generic.List[int]
-        foreach ($fatSec in $fatSectorList) {
-            $fs.Position = ($fatSec + 1) * $sectorSize
-            $entriesPerSector = $sectorSize / 4
-            for ($i = 0; $i -lt $entriesPerSector; $i++) {
-                $fatData.Add($br.ReadInt32())
-            }
-        }
-
-        $fatData = New-Object System.Collections.Generic.List[int]
-        foreach ($fatSec in $fatSectorList) {
-            $fs.Position = ($fatSec + 1) * $sectorSize
-            $entriesPerSector = $sectorSize / 4
-            for ($i = 0; $i -lt $entriesPerSector; $i++) {
-                $fatData.Add($br.ReadInt32())
-            }
-        }
-
-        # Walk directory sector chain and collect stream names
-        $streamNames = @{}
-        $sector = $dirStartSector
-        $visited = @{}
-
-        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 -and -not $visited.ContainsKey($sector)) {
-            $visited[$sector] = $true
-            $fs.Position = ($sector + 1) * $sectorSize
-
-            $dirBytes = $br.ReadBytes($sectorSize)
-            $entryCount = $sectorSize / 128
-
-            for ($e = 0; $e -lt $entryCount; $e++) {
-                $offset     = $e * 128
-                $nameLen    = [System.BitConverter]::ToInt16($dirBytes, $offset + 64)  # byte length of name
-                $entryType  = $dirBytes[$offset + 66]   # 0=empty, 1=storage, 2=stream, 5=root
-
-                if ($entryType -gt 0 -and $nameLen -gt 0) {
-                    $nameBytes = $dirBytes[$offset..($offset + $nameLen - 1)]
-                    $name      = [System.Text.Encoding]::Unicode.GetString($nameBytes).TrimEnd([char]0)
-                    $streamSize = [int64][System.BitConverter]::ToUInt32($dirBytes, $offset + 120)
-                    $startSec   = [System.BitConverter]::ToInt32($dirBytes, $offset + 116)
-                    $streamNames[$name] = [PSCustomObject]@{ Size = $streamSize; Start = $startSec; Type = $entryType }
+            foreach ($fatSec in $fatSectorList) {
+                $fs.Position = ($fatSec + 1) * $sectorSize
+                $entriesPerSector = $sectorSize / 4
+                for ($i = 0; $i -lt $entriesPerSector; $i++) {
+                    $fatData.Add($br.ReadInt32())
                 }
             }
 
-            # Follow FAT chain to next directory sector
-            if ($sector -lt $fatData.Count) {
-                $sector = $fatData[$sector]
-            } else {
-                break
+            $fatData = New-Object System.Collections.Generic.List[int]
+            foreach ($fatSec in $fatSectorList) {
+                $fs.Position = ($fatSec + 1) * $sectorSize
+                $entriesPerSector = $sectorSize / 4
+                for ($i = 0; $i -lt $entriesPerSector; $i++) {
+                    $fatData.Add($br.ReadInt32())
+                }
+            }
+
+
+            # Walk directory sector chain and collect stream names
+            $streamNames = @{}
+            $sector = $dirStartSector
+            $visited = @{}
+
+            while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 -and -not $visited.ContainsKey($sector)) {
+                $visited[$sector] = $true
+                $fs.Position = ($sector + 1) * $sectorSize
+
+                $dirBytes = $br.ReadBytes($sectorSize)
+                $entryCount = $sectorSize / 128
+
+                for ($e = 0; $e -lt $entryCount; $e++) {
+                    $offset     = $e * 128
+                    $nameLen    = [System.BitConverter]::ToInt16($dirBytes, $offset + 64)  # byte length of name
+                    $entryType  = $dirBytes[$offset + 66]   # 0=empty, 1=storage, 2=stream, 5=root
+
+                    if ($entryType -gt 0 -and $nameLen -gt 0) {
+                        $nameBytes = $dirBytes[$offset..($offset + $nameLen - 1)]
+                        $name      = [System.Text.Encoding]::Unicode.GetString($nameBytes).TrimEnd([char]0)
+                        $streamSize = [int64][System.BitConverter]::ToUInt32($dirBytes, $offset + 120)
+                        $startSec   = [System.BitConverter]::ToInt32($dirBytes, $offset + 116)
+                        $streamNames[$name] = [PSCustomObject]@{ Size = $streamSize; Start = $startSec; Type = $entryType }
+                    }
+                }
+
+                # Follow FAT chain to next directory sector
+                if ($sector -lt $fatData.Count) {
+                    $sector = $fatData[$sector]
+                } else {
+                    break
+                }
             }
         }
-
-        $fs.Close()
-
+        finally {
+            $br.Close()
+            $br.Dispose()
+            $fs.Close()
+            $fs.Dispose()
+        }
         # ---------------------------------------------------------------
         # PASSWORD-TO-OPEN detection
         # ---------------------------------------------------------------
@@ -612,7 +627,7 @@ function Read-OleStream {
         $buffer = New-Object System.Collections.Generic.List[byte]
 
         $sector    = $StartSector
-        $remaining = $Size
+        [int64]$remaining = $Size
         $visited   = @{}
 
         while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 -and -not $visited.ContainsKey($sector)) {
@@ -636,6 +651,22 @@ function Read-OleStream {
     }
     catch {
         return $null
+    }
+    finally {
+        try{
+            if($br) {
+                $br.Close()
+                $br.Dispose()
+            }
+        }
+        catch {}
+        try {
+            if($fs) {
+                $fs.Close()
+                $fs.Dispose()
+            }
+        }
+        catch{}
     }
 }
 
@@ -1417,7 +1448,7 @@ function Update-FileAgeProperties {
         [string]$skippedFiles,
         [int]$openXmlParallelItems = 10,
         [int]$pdfParallelItems     = 10,
-        [int]$comParallelItems     = 5,
+        [int]$comParallelItems     = 1,
 
         # Batch trigger thresholds   how many files accumulate in a queue
         # before that queue is dispatched as a batch. This is NOT a
@@ -2113,6 +2144,20 @@ function Process-COMBatch {
                                     if ($action -eq "ContinueFile") { continue }
                                 }
                                 else {
+
+                                    $leaf = Split-Path $file -Leaf
+                                    $lockName = "~$" + $(if ($leaf.Length -gt 2) { $leaf.Substring(2) } else { $leaf })
+                                    $lockFile = Join-Path (Split-Path $file -Parent) $lockName
+
+                                    if (Test-Path -LiteralPath $lockfile) {
+                                        try {
+                                            Remove-Item -LiteralPath $lockFile -force
+                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file removed orphaned lock file $lockFile"
+                                        }
+                                        catch {
+                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $ could not remove lock file $lockFile : $($_.Exception.Message)"
+                                        }
+                                    }
                                     $doc = $app.Documents.Open($file, $false, $false)
                                 }
                             }
@@ -2177,6 +2222,19 @@ function Process-COMBatch {
                                     if ($action -eq "ContinueFile") { continue }
                                 }
                                 else {
+                                    $leaf = Split-Path $file -Leaf
+                                    $lockName = "~$" + $(if ($leaf.Length -gt 2) { $leaf.Substring(2) } else { $leaf })
+                                    $lockFile = Join-Path (Split-Path $file -Parent) $lockName
+
+                                    if (Test-Path -LiteralPath $lockfile) {
+                                        try {
+                                            Remove-Item -LiteralPath $lockFile -force
+                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file removed orphaned lock file $lockFile"
+                                        }
+                                        catch {
+                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $ could not remove lock file $lockFile : $($_.Exception.Message)"
+                                        }
+                                    }
                                     $doc = $app.Workbooks.Open($file, 0, $false)
                                 }
                             }
@@ -2553,8 +2611,34 @@ function Execute_Tagging() {
 		}
  
 		if(($filesToScan).Count -ne 0) {
-			$filesToScanUnique = $filesToScan | sort -Unique
-			$continue = $true
+			#$filesToScanUnique = $filesToScan | sort -Unique
+            $scannedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $skippedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $pendingSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            foreach($f in $scannedFilesList) {$scannedSet.Add($f.trim()) | Out-Null }
+            foreach($f in $skippedFilesListUnique) { $skippedSet.Add($f.trim()) | Out-Null }
+
+            foreach($targetFile in $targetFilesList) {
+                $t = $targetFile.Trim()
+                if ($scannedSet.Contains($t)) {
+                    Write-Host "$t has already been scanned"
+                }
+                elseif ($skippedSet.Contains($t)) {
+                    Write-Host "$t has already been skipped previously"
+                }
+                else {
+                    $pendingSet.Add($t) | Out-Null 
+                }
+
+            }
+            
+
+            $filesToScanUnique = [System.Collections.ArrayList]@($pendingSet)
+
+
+
+			$continue = (($filesToScanUnique).Count -ne 0)
 		}
 	}
 	else {
@@ -2794,8 +2878,8 @@ Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProce
 # SIG # Begin signature block
 # MIIFjgYJKoZIhvcNAQcCoIIFfzCCBXsCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUo94POIZDVbX82kfiko1dbJeg
-# hhGgggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUZkA3/iA/qCRKQ/qgzbJDJNKZ
+# LX2gggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
 # AQsFADAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZzAeFw0y
 # NjA3MDMxMDAyNTVaFw0zMTA3MDMxMDEyNTFaMCUxIzAhBgNVBAMMGlVEUiBUYWdn
 # aW5nIFNjcmlwdCBTaWduaW5nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
@@ -2815,11 +2899,11 @@ Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProce
 # OTAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZwIQE7EWVmkf
 # AJtDYwn54Vq9kjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKA
 # ADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYK
-# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQU5UDiLdd+jqZv/o8SA8PCO78UQuUw
-# DQYJKoZIhvcNAQEBBQAEggEAeMv/y59+L6BHm9oOHylcQokdDh/cgZ/8Lt4UFARq
-# 5zQH6ucHY+wSeteKqQzDDD/Q7rAWfzgO/14OBEQK2LGE1OcfRBPeh7c1w8PltPqY
-# FpXSUBQl8832sCdg8WABlovXCNbJhzc4EFUKwem9pMLdRGaBpEOv1DISTfd7Q1I+
-# b2xjn32KvhRzsGv5GQWdc/j1eTYVlIe9MXvNne8V+esAC9tRFdYs5Sm3Qq1Fc5xW
-# 7xVY+YOh0qX1yjTBA0qe9quTIFl0047Al70FPHKL72lodqSsMHpf5qLh+6n/TN0f
-# zb6Y9ljFeclaG44xZQ2X8Z+tm0hNMUcwKi9LcEFP9W8RuQ==
+# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUJEtkJSLpgfZV3sTWemMsb87kVVMw
+# DQYJKoZIhvcNAQEBBQAEggEASC1kKTaNW6Mq6XcabsxayLmaQaRwNCgVL+hTx28g
+# CEDdY9U7F6M6EfDSWENIHjhcoaMJn3fpli3RqCToqQVxW4IRRFualS2/ND4tE9Ge
+# msTEmn/pEFJnSPzjJE2qwgPQtMOT4gi/CeN0yXVy8GM6iYfm3t03NDgtc7SAfCBZ
+# FHOW/dtPCZkG8+uewA2ntv62lhxSF3Ei+Ty8HipB3sYv4hqxOxFfd5H05DWYAPY2
+# t5Kv+v/LojfE39SVjTVdKoDe08BAkl0iJEa3DAS/2rFK1mfb9Dms834xt7/8eI47
+# 6ONhtOkiSTI/1TijVVgWvS+tLZ83/WeW7Jy4LBDiV30LVA==
 # SIG # End signature block

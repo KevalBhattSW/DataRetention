@@ -18,8 +18,7 @@ if (-not (Test-Path -LiteralPath $DrivePath -PathType Container)) {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: Add-ContentSafe
-# Thread-safe file append used by runspaces
+# Add-ContentSafe
 # ---------------------------------------------------------------------------
 function Add-ContentSafe {
     param(
@@ -47,8 +46,7 @@ function Add-ContentSafe {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: Get-FolderDepth
-# Returns the depth of a path relative to the root drive path
+# Get-FolderDepth
 # ---------------------------------------------------------------------------
 function Get-FolderDepth {
     param([string]$FolderPath, [string]$RootPath)
@@ -58,120 +56,108 @@ function Get-FolderDepth {
 }
 
 # ---------------------------------------------------------------------------
-# Core scan function — called per top-level subfolder in a runspace
-# Uses robocopy /L /NFL /NDL /NJH /NJS /NC /BYTES to get counts fast
-# without loading all filenames into PowerShell memory
+# Get-RecursiveCounts
+# Returns total files, subfolders and size beneath a folder (all depths)
+# using a stack walk — no recursion depth limit.
 # ---------------------------------------------------------------------------
-function Get-FolderStats {
-    param(
-        [string]$FolderPath,
-        [string]$RootPath,
-        [string]$OutputCsv,
-        [string]$LogPath,
-        [bool]$DepthLimited,
-        [int]$MaxDepth
-    )
+function Get-RecursiveCounts {
+    param([string]$FolderPath)
 
-    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $totalFiles   = 0
+    $totalFolders = 0
+    $totalBytes   = 0L
 
-    try {
-        # Build list of folders to scan at the right depth
-        $foldersToScan = [System.Collections.Generic.List[string]]::new()
-        $foldersToScan.Add($FolderPath)
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push($FolderPath)
 
-        # Get all subfolders up to MaxDepth (for depth-limited) or all (for full)
-        $queue = [System.Collections.Generic.Queue[string]]::new()
-        $queue.Enqueue($FolderPath)
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
 
-        while ($queue.Count -gt 0) {
-            $current = $queue.Dequeue()
-            $depth   = Get-FolderDepth -FolderPath $current -RootPath $RootPath
-
-            try {
-                $subDirs = [System.IO.Directory]::GetDirectories($current)
+        try {
+            $files = [System.IO.Directory]::GetFiles($current)
+            $totalFiles += $files.Count
+            foreach ($f in $files) {
+                try { $totalBytes += (New-Object System.IO.FileInfo($f)).Length } catch {}
             }
-            catch {
-                $subDirs = @()
-            }
+        } catch {}
 
-            foreach ($sub in $subDirs) {
-                $subDepth = Get-FolderDepth -FolderPath $sub -RootPath $RootPath
-                $foldersToScan.Add($sub)
-
-                if (-not $DepthLimited -or $subDepth -lt $MaxDepth) {
-                    $queue.Enqueue($sub)
-                }
-            }
-        }
-
-        # For each folder, count direct children only (non-recursive per folder)
-        foreach ($folder in $foldersToScan) {
-            $depth = Get-FolderDepth -FolderPath $folder -RootPath $RootPath
-
-            if ($DepthLimited -and $depth -gt $MaxDepth) { continue }
-
-            $fileCount      = 0
-            $subFolderCount = 0
-            $totalSizeBytes = 0L
-
-            try {
-                $di = [System.IO.DirectoryInfo]::new($folder)
-
-                # Count direct files
-                try {
-                    $files = $di.GetFiles()
-                    $fileCount = $files.Count
-                    foreach ($f in $files) {
-                        try { $totalSizeBytes += $f.Length } catch {}
-                    }
-                }
-                catch { $fileCount = -1 }
-
-                # Count direct subfolders
-                try {
-                    $subFolderCount = $di.GetDirectories().Count
-                }
-                catch { $subFolderCount = -1 }
-            }
-            catch {
-                $fileCount      = -1
-                $subFolderCount = -1
-            }
-
-            $sizeMB = if ($totalSizeBytes -ge 0) {
-                [math]::Round($totalSizeBytes / 1MB, 2)
-            } else { -1 }
-
-            $relative = $folder.Substring($RootPath.TrimEnd('\').Length).TrimStart('\')
-            if ($relative -eq '') { $relative = '\' }
-
-            $results.Add([PSCustomObject]@{
-                FolderPath      = $folder
-                RelativePath    = $relative
-                Depth           = $depth
-                DirectFiles     = $fileCount
-                DirectSubfolders = $subFolderCount
-                DirectSizeMB    = $sizeMB
-            })
-        }
-    }
-    catch {
-        Add-ContentSafe -Path $LogPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ERROR scanning $FolderPath : $($_.Exception.Message)"
+        try {
+            $subs = [System.IO.Directory]::GetDirectories($current)
+            $totalFolders += $subs.Count
+            foreach ($s in $subs) { $stack.Push($s) }
+        } catch {}
     }
 
-    # Write results to CSV (thread-safe, one row at a time)
-    foreach ($row in $results) {
-        $line = '"{0}","{1}",{2},{3},{4},{5}' -f `
-            $row.FolderPath, $row.RelativePath, $row.Depth,
-            $row.DirectFiles, $row.DirectSubfolders, $row.DirectSizeMB
-        Add-ContentSafe -Path $OutputCsv -Value $line
+    return [PSCustomObject]@{
+        TotalFiles   = $totalFiles
+        TotalFolders = $totalFolders
+        TotalSizeMB  = [math]::Round($totalBytes / 1MB, 2)
     }
-
-    return $results.Count
 }
 
 # ---------------------------------------------------------------------------
-# Parallel dispatch — splits top-level subfolders across runspaces
+# Get-FolderRow
+# Returns a single CSV row object for a folder.
+# If $Recursive is true, counts are totals for everything beneath.
+# If $Recursive is false, counts are direct children only.
+# ---------------------------------------------------------------------------
+function Get-FolderRow {
+    param(
+        [string]$FolderPath,
+        [string]$RootPath,
+        [bool]$Recursive
+    )
+
+    $depth    = Get-FolderDepth -FolderPath $FolderPath -RootPath $RootPath
+    $relative = $FolderPath.Substring($RootPath.TrimEnd('\').Length).TrimStart('\')
+    if ($relative -eq '') { $relative = '\' }
+
+    if ($Recursive) {
+        $counts = Get-RecursiveCounts -FolderPath $FolderPath
+        return [PSCustomObject]@{
+            FolderPath   = $FolderPath
+            RelativePath = $relative
+            Depth        = $depth
+            Files        = $counts.TotalFiles
+            Subfolders   = $counts.TotalFolders
+            SizeMB       = $counts.TotalSizeMB
+            CountType    = "Recursive"
+        }
+    }
+    else {
+        $fileCount   = 0
+        $subCount    = 0
+        $totalBytes  = 0L
+
+        try {
+            $files = (New-Object System.IO.DirectoryInfo($FolderPath)).GetFiles()
+            $fileCount = $files.Count
+            foreach ($f in $files) { try { $totalBytes += $f.Length } catch {} }
+        } catch { $fileCount = -1 }
+
+        try {
+            $subCount = (New-Object System.IO.DirectoryInfo($FolderPath)).GetDirectories().Count
+        } catch { $subCount = -1 }
+
+        return [PSCustomObject]@{
+            FolderPath   = $FolderPath
+            RelativePath = $relative
+            Depth        = $depth
+            Files        = $fileCount
+            Subfolders   = $subCount
+            SizeMB       = [math]::Round($totalBytes / 1MB, 2)
+            CountType    = "Direct"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Invoke-ParallelFolderScan
+# Splits top-level subfolders across runspaces. Each runspace walks its
+# assigned subtree, emitting:
+#   - Direct-count rows for folders shallower than MaxDepth (depth-limited)
+#     or all folders (full scan)
+#   - A single recursive-count row for folders AT MaxDepth (depth-limited only)
 # ---------------------------------------------------------------------------
 function Invoke-ParallelFolderScan {
     param(
@@ -183,25 +169,18 @@ function Invoke-ParallelFolderScan {
         [int]$ParallelItems
     )
 
-    # Write CSV header
-    Add-ContentSafe -Path $OutputCsv -Value '"FolderPath","RelativePath","Depth","DirectFiles","DirectSubfolders","DirectSizeMB"'
+    # CSV header
+    Add-ContentSafe -Path $OutputCsv -Value '"FolderPath","RelativePath","Depth","Files","Subfolders","SizeMB","CountType"'
 
-    # Write root folder itself first
-    $rootDi         = [System.IO.DirectoryInfo]::new($RootPath)
-    $rootFiles      = try { $rootDi.GetFiles() }      catch { @() }
-    $rootSubDirs    = try { $rootDi.GetDirectories() } catch { @() }
-    $rootSizeBytes  = ($rootFiles | ForEach-Object { try { $_.Length } catch { 0 } } | Measure-Object -Sum).Sum
-    $rootSizeMB     = [math]::Round($rootSizeBytes / 1MB, 2)
+    # Root row (always direct counts)
+    $rootRow = Get-FolderRow -FolderPath $RootPath -RootPath $RootPath -Recursive $false
+    Add-ContentSafe -Path $OutputCsv -Value (
+        '"{0}","{1}",{2},{3},{4},{5},"{6}"' -f
+        $rootRow.FolderPath, $rootRow.RelativePath, $rootRow.Depth,
+        $rootRow.Files, $rootRow.Subfolders, $rootRow.SizeMB, $rootRow.CountType
+    )
 
-    $rootLine = '"{0}","{1}",{2},{3},{4},{5}' -f `
-        $RootPath, '\', 0, $rootFiles.Count, $rootSubDirs.Count, $rootSizeMB
-    Add-ContentSafe -Path $OutputCsv -Value $rootLine
-
-    # Get top-level subfolders to distribute across runspaces
-    $topLevel = try {
-        [System.IO.Directory]::GetDirectories($RootPath)
-    } catch { @() }
-
+    $topLevel = try { [System.IO.Directory]::GetDirectories($RootPath) } catch { @() }
     if ($topLevel.Count -eq 0) {
         Write-Host "No subfolders found under $RootPath"
         return
@@ -209,9 +188,10 @@ function Invoke-ParallelFolderScan {
 
     Write-Host "Scanning $($topLevel.Count) top-level folders with $ParallelItems parallel runspaces..."
 
-    $fnAddContentSafe  = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
-    $fnGetFolderDepth  = "function Get-FolderDepth { ${function:Get-FolderDepth} }"
-    $fnGetFolderStats  = "function Get-FolderStats { ${function:Get-FolderStats} }"
+    $fnAddContentSafe   = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
+    $fnGetFolderDepth   = "function Get-FolderDepth { ${function:Get-FolderDepth} }"
+    $fnGetRecursive     = "function Get-RecursiveCounts { ${function:Get-RecursiveCounts} }"
+    $fnGetFolderRow     = "function Get-FolderRow { ${function:Get-FolderRow} }"
 
     $pool = [runspacefactory]::CreateRunspacePool(1, $ParallelItems)
     $pool.Open()
@@ -219,25 +199,58 @@ function Invoke-ParallelFolderScan {
     $jobs = @()
 
     foreach ($topFolder in $topLevel) {
+
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
 
-        $ps.AddScript($fnAddContentSafe)  | Out-Null
-        $ps.AddScript($fnGetFolderDepth)  | Out-Null
-        $ps.AddScript($fnGetFolderStats)  | Out-Null
+        $ps.AddScript($fnAddContentSafe) | Out-Null
+        $ps.AddScript($fnGetFolderDepth) | Out-Null
+        $ps.AddScript($fnGetRecursive)   | Out-Null
+        $ps.AddScript($fnGetFolderRow)   | Out-Null
 
         $ps.AddScript({
-            param($FolderPath, $RootPath, $OutputCsv, $LogPath, $DepthLimited, $MaxDepth)
+            param($TopFolder, $RootPath, $OutputCsv, $LogPath, $DepthLimited, $MaxDepth)
 
-            $count = Get-FolderStats `
-                -FolderPath    $FolderPath `
-                -RootPath      $RootPath `
-                -OutputCsv     $OutputCsv `
-                -LogPath       $LogPath `
-                -DepthLimited  $DepthLimited `
-                -MaxDepth      $MaxDepth
+            $rowsWritten = 0
 
-            Write-Output "Scanned $FolderPath — $count folders"
+            # Stack-based walk
+            $stack = [System.Collections.Generic.Stack[string]]::new()
+            $stack.Push($TopFolder)
+
+            while ($stack.Count -gt 0) {
+                $current = $stack.Pop()
+                $depth   = Get-FolderDepth -FolderPath $current -RootPath $RootPath
+
+                if ($DepthLimited -and $depth -eq $MaxDepth) {
+                    # At boundary — emit recursive totals, don't push children
+                    $row = Get-FolderRow -FolderPath $current -RootPath $RootPath -Recursive $true
+                }
+                else {
+                    # Above boundary (or full scan) — emit direct counts, push children
+                    $row = Get-FolderRow -FolderPath $current -RootPath $RootPath -Recursive $false
+
+                    try {
+                        $subs = [System.IO.Directory]::GetDirectories($current)
+                        foreach ($sub in $subs) {
+                            $subDepth = Get-FolderDepth -FolderPath $sub -RootPath $RootPath
+                            if (-not $DepthLimited -or $subDepth -le $MaxDepth) {
+                                $stack.Push($sub)
+                            }
+                        }
+                    } catch {
+                        Add-ContentSafe -Path $LogPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Cannot enumerate $current : $($_.Exception.Message)"
+                    }
+                }
+
+                $line = '"{0}","{1}",{2},{3},{4},{5},"{6}"' -f `
+                    $row.FolderPath, $row.RelativePath, $row.Depth,
+                    $row.Files, $row.Subfolders, $row.SizeMB, $row.CountType
+                Add-ContentSafe -Path $OutputCsv -Value $line
+                $rowsWritten++
+            }
+
+            Write-Output "$TopFolder — $rowsWritten rows"
+
         }) | Out-Null
 
         $ps.AddArgument($topFolder)    | Out-Null
@@ -253,15 +266,12 @@ function Invoke-ParallelFolderScan {
         }
     }
 
-    # Wait and collect
     $completed = 0
     foreach ($job in $jobs) {
         $job.Handle.AsyncWaitHandle.WaitOne() | Out-Null
         try {
             $output = $job.Pipe.EndInvoke($job.Handle)
-            foreach ($line in $output) {
-                Write-Host $line
-            }
+            foreach ($line in $output) { Write-Host $line }
         }
         catch {
             Write-Warning "Runspace error: $($_.Exception.Message)"
@@ -282,16 +292,15 @@ function Invoke-ParallelFolderScan {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-$timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$outputDir  = "$ScriptPath\FolderReports"
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$outputDir = "$ScriptPath\FolderReports"
 
 if (-not (Test-Path $outputDir -PathType Container)) {
     New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
 }
 
-$logPath    = "$outputDir\$($timestamp)_FolderReport.log"
+$logPath = "$outputDir\$($timestamp)_FolderReport.log"
 New-Item -Path $logPath -ItemType File -Force | Out-Null
-
 Add-ContentSafe -Path $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Starting folder report for $DrivePath  Mode=$Mode  MaxDepth=$MaxDepth  ParallelItems=$ParallelItems"
 
 if ($Mode -eq "Depth" -or $Mode -eq "Both") {
@@ -299,7 +308,7 @@ if ($Mode -eq "Depth" -or $Mode -eq "Both") {
     New-Item -Path $csvDepth -ItemType File -Force | Out-Null
 
     Write-Host ""
-    Write-Host "=== DEPTH-LIMITED SCAN (max $MaxDepth levels) ==="
+    Write-Host "=== DEPTH-LIMITED SCAN (max $MaxDepth levels, recursive totals at boundary) ==="
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     Invoke-ParallelFolderScan `

@@ -106,13 +106,13 @@ function Process-FileListingBatch {
             }
             catch {
                 Add-ContentSafe -Path $progressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $objFile could not be opened: $($_.Exception.Message)"
-                return $null
+                return
             }
 
             # Skip Office temp/lock files — these have the "~$" prefix on the
             # filename itself (e.g. "~$document.docx"), not the path.
             if ($item.Name.StartsWith("~$")) {
-                return $null
+                return
             }
 
             $currentFileSize = $item.Length.ToString()
@@ -196,7 +196,7 @@ function Process-FileListingBatch {
 function Wait-AndCollectJobs {
     param($BatchResult)
 
-    $collected = @()
+    $collected = [System.Collections.Generic.List[object]]::new()
     if ($null -eq $BatchResult) { return $collected }
 
     foreach ($job in $BatchResult.Jobs) {
@@ -205,7 +205,9 @@ function Wait-AndCollectJobs {
         $job.Handle.AsyncWaitHandle.WaitOne()
         try {
             $output = $job.Pipe.EndInvoke($job.Handle)
-            if ($output) { $collected += $output }
+            foreach ($item in $output) {
+                if ($null -ne $item) { $collected.Add($item) }
+            }
         }
         catch {
             Write-Warning "Runspace error: $($_.Exception.Message)"
@@ -221,6 +223,31 @@ function Wait-AndCollectJobs {
     }
 
     return $collected
+}
+
+
+# ---------------------------------------------------------------------------
+# Write-BatchRows
+# Shared helper — filters and writes a collection of row objects to the
+# output file. Skips nulls, rows with no Name, and all-tab lines.
+# ---------------------------------------------------------------------------
+function Write-BatchRows {
+    param(
+        [object[]]$Rows,
+        [string]$OutputFile
+    )
+    foreach ($row in $Rows) {
+        if ($null -eq $row) { continue }
+        if ([string]::IsNullOrWhiteSpace($row.Name)) { continue }
+        if ([string]::IsNullOrWhiteSpace($row.ContainingPath)) { continue }
+        $line = @($row.Name, $row.ContainingPath, $row.Size,
+                  $row.LastModified, $row.LastAccessed,
+                  $row.CreationDate, $row.Extension,
+                  $row.LastSaveDate, $row.DateChecked) -Join [char]9
+        # Guard against all-tab lines (all fields empty)
+        if ($line.Replace([char]9, '').Trim().Length -eq 0) { continue }
+        Add-Content -Path $OutputFile -Value $line
+    }
 }
 
 
@@ -274,7 +301,7 @@ function Invoke-StreamingFileListing {
     $batch = [System.Collections.ArrayList]::new()
 
     $totalFound     = 0
-    $totalProcessed = 0
+    $totalWritten   = 0
     $batchNumber    = 0
 
     # Stack-based iterative directory walk — avoids PowerShell recursion
@@ -296,6 +323,10 @@ function Invoke-StreamingFileListing {
         }
 
         foreach ($file in $dirFiles) {
+            # Skip temp/lock files at enumeration time
+            $leafName = [System.IO.Path]::GetFileName($file)
+            if ($leafName.StartsWith("~$")) { continue }
+
             if ($seen.Add($file)) {
                 $batch.Add($file) | Out-Null
                 $totalFound++
@@ -314,21 +345,14 @@ function Invoke-StreamingFileListing {
                         -mappedPath    $MappedPath
 
                     $rows = Wait-AndCollectJobs -BatchResult $batchResult
-                    foreach ($row in $rows) {
-                        if ($null -eq $row) { continue }
-                        $line = @($row.Name, $row.ContainingPath, $row.Size,
-                                  $row.LastModified, $row.LastAccessed,
-                                  $row.CreationDate, $row.Extension,
-                                  $row.LastSaveDate, $row.DateChecked) -Join [char]9
-                        Add-Content -Path $OutputFile -Value $line
-                    }
+                    Write-BatchRows -Rows $rows -OutputFile $OutputFile
+                    $totalWritten += ($rows | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace($_.Name) }).Count
 
-                    $totalProcessed += $batchCopy.Count
                     $batch.Clear()
 
                     Write-Progress -Activity "Cataloguing files" `
-                                   -Status "$totalProcessed files written, $totalFound found" `
-                                   -PercentComplete -1   # indeterminate — total unknown upfront
+                                   -Status "Batch $batchNumber complete — $totalFound found, $totalWritten written" `
+                                   -PercentComplete -1
                 }
             }
         }
@@ -343,8 +367,8 @@ function Invoke-StreamingFileListing {
         }
 
         foreach ($sub in $subDirs) {
-            $leafName = [System.IO.Path]::GetFileName($sub)
-            if ($leafName -ieq "~snapshot") {
+            $subLeaf = [System.IO.Path]::GetFileName($sub)
+            if ($subLeaf -ieq "~snapshot") {
                 Write-Host "Skipping snapshot folder: $sub"
                 Add-ContentSafe -Path $ProgressFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Skipping snapshot folder: $sub"
                 continue
@@ -366,22 +390,14 @@ function Invoke-StreamingFileListing {
             -mappedPath    $MappedPath
 
         $rows = Wait-AndCollectJobs -BatchResult $batchResult
-        foreach ($row in $rows) {
-            if ($null -eq $row) { continue }
-            $line = @($row.Name, $row.ContainingPath, $row.Size,
-                      $row.LastModified, $row.LastAccessed,
-                      $row.CreationDate, $row.Extension,
-                      $row.LastSaveDate, $row.DateChecked) -Join [char]9
-            Add-Content -Path $OutputFile -Value $line
-        }
-
-        $totalProcessed += $batch.Count
+        Write-BatchRows -Rows $rows -OutputFile $OutputFile
+        $totalWritten += ($rows | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace($_.Name) }).Count
     }
 
     Write-Progress -Activity "Cataloguing files" -Completed
 
     $endTimeF = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-    Add-ContentSafe -Path $ProgressFile -Value "Catalogue for $OutputFile ended at $endTimeF — $totalFound unique files found, $totalProcessed rows written"
+    Add-ContentSafe -Path $ProgressFile -Value "Catalogue for $OutputFile ended at $endTimeF — $totalFound unique files found, $totalWritten rows written"
 
     return $totalFound
 }

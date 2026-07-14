@@ -56,9 +56,39 @@ function Get-FolderDepth {
 }
 
 # ---------------------------------------------------------------------------
+# Get-FileTypeCategory
+# Classifies a single file path into one of: PDF, COM, OpenXML, Other.
+#   PDF     - .pdf
+#   COM     - legacy binary Office: .doc, .xls, .ppt
+#   OpenXML - modern Office: .docx, .docm, .xlsx, .xlsm, .xlsb, .pptx, .pptm
+#   Other   - everything else
+# Matches the classification logic used in the UDR tagging script.
+# ---------------------------------------------------------------------------
+function Get-FileTypeCategory {
+    param([string]$FilePath)
+
+    $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+
+    switch ($ext) {
+        ".pdf"  { return "PDF" }
+        ".doc"  { return "COM" }
+        ".xls"  { return "COM" }
+        ".ppt"  { return "COM" }
+        ".docx" { return "OpenXML" }
+        ".docm" { return "OpenXML" }
+        ".xlsx" { return "OpenXML" }
+        ".xlsm" { return "OpenXML" }
+        ".xlsb" { return "OpenXML" }
+        ".pptx" { return "OpenXML" }
+        ".pptm" { return "OpenXML" }
+        default { return "Other" }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Get-RecursiveCounts
-# Returns total files, subfolders and size beneath a folder (all depths)
-# using a stack walk — no recursion depth limit.
+# Returns total files, subfolders, size, and file-type breakdown beneath a
+# folder (all depths) using a stack walk — no recursion depth limit.
 # ---------------------------------------------------------------------------
 function Get-RecursiveCounts {
     param([string]$FolderPath)
@@ -66,6 +96,10 @@ function Get-RecursiveCounts {
     $totalFiles   = 0
     $totalFolders = 0
     $totalBytes   = 0L
+    $pdfCount     = 0
+    $comCount     = 0
+    $openXmlCount = 0
+    $otherCount   = 0
 
     $stack = [System.Collections.Generic.Stack[string]]::new()
     $stack.Push($FolderPath)
@@ -78,6 +112,12 @@ function Get-RecursiveCounts {
             $totalFiles += $files.Count
             foreach ($f in $files) {
                 try { $totalBytes += (New-Object System.IO.FileInfo($f)).Length } catch {}
+                switch (Get-FileTypeCategory -FilePath $f) {
+                    "PDF"     { $pdfCount++ }
+                    "COM"     { $comCount++ }
+                    "OpenXML" { $openXmlCount++ }
+                    default   { $otherCount++ }
+                }
             }
         } catch {}
 
@@ -92,6 +132,10 @@ function Get-RecursiveCounts {
         TotalFiles   = $totalFiles
         TotalFolders = $totalFolders
         TotalSizeMB  = [math]::Round($totalBytes / 1MB, 2)
+        PdfCount     = $pdfCount
+        ComCount     = $comCount
+        OpenXmlCount = $openXmlCount
+        OtherCount   = $otherCount
     }
 }
 
@@ -122,18 +166,34 @@ function Get-FolderRow {
             Subfolders   = $counts.TotalFolders
             SizeMB       = $counts.TotalSizeMB
             CountType    = "Recursive"
+            PDF          = $counts.PdfCount
+            COM          = $counts.ComCount
+            OpenXML      = $counts.OpenXmlCount
+            Other        = $counts.OtherCount
         }
     }
     else {
         $fileCount   = 0
         $subCount    = 0
         $totalBytes  = 0L
+        $pdfCount    = 0
+        $comCount    = 0
+        $openXmlCount = 0
+        $otherCount  = 0
 
         try {
             $files = (New-Object System.IO.DirectoryInfo($FolderPath)).GetFiles()
             $fileCount = $files.Count
-            foreach ($f in $files) { try { $totalBytes += $f.Length } catch {} }
-        } catch { $fileCount = -1 }
+            foreach ($f in $files) {
+                try { $totalBytes += $f.Length } catch {}
+                switch (Get-FileTypeCategory -FilePath $f.FullName) {
+                    "PDF"     { $pdfCount++ }
+                    "COM"     { $comCount++ }
+                    "OpenXML" { $openXmlCount++ }
+                    default   { $otherCount++ }
+                }
+            }
+        } catch { $fileCount = -1; $pdfCount = -1; $comCount = -1; $openXmlCount = -1; $otherCount = -1 }
 
         try {
             $subCount = (New-Object System.IO.DirectoryInfo($FolderPath)).GetDirectories().Count
@@ -147,6 +207,10 @@ function Get-FolderRow {
             Subfolders   = $subCount
             SizeMB       = [math]::Round($totalBytes / 1MB, 2)
             CountType    = "Direct"
+            PDF          = $pdfCount
+            COM          = $comCount
+            OpenXML      = $openXmlCount
+            Other        = $otherCount
         }
     }
 }
@@ -170,14 +234,15 @@ function Invoke-ParallelFolderScan {
     )
 
     # CSV header
-    Add-ContentSafe -Path $OutputCsv -Value '"FolderPath","RelativePath","Depth","Files","Subfolders","SizeMB","CountType"'
+    Add-ContentSafe -Path $OutputCsv -Value '"FolderPath","RelativePath","Depth","Files","Subfolders","SizeMB","CountType","PDF","COM","OpenXML","Other"'
 
     # Root row (always direct counts)
     $rootRow = Get-FolderRow -FolderPath $RootPath -RootPath $RootPath -Recursive $false
     Add-ContentSafe -Path $OutputCsv -Value (
-        '"{0}","{1}",{2},{3},{4},{5},"{6}"' -f
+        '"{0}","{1}",{2},{3},{4},{5},"{6}",{7},{8},{9},{10}' -f
         $rootRow.FolderPath, $rootRow.RelativePath, $rootRow.Depth,
-        $rootRow.Files, $rootRow.Subfolders, $rootRow.SizeMB, $rootRow.CountType
+        $rootRow.Files, $rootRow.Subfolders, $rootRow.SizeMB, $rootRow.CountType,
+        $rootRow.PDF, $rootRow.COM, $rootRow.OpenXML, $rootRow.Other
     )
 
     $topLevel = try { [System.IO.Directory]::GetDirectories($RootPath) } catch { @() }
@@ -190,6 +255,7 @@ function Invoke-ParallelFolderScan {
 
     $fnAddContentSafe   = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
     $fnGetFolderDepth   = "function Get-FolderDepth { ${function:Get-FolderDepth} }"
+    $fnGetFileTypeCat   = "function Get-FileTypeCategory { ${function:Get-FileTypeCategory} }"
     $fnGetRecursive     = "function Get-RecursiveCounts { ${function:Get-RecursiveCounts} }"
     $fnGetFolderRow     = "function Get-FolderRow { ${function:Get-FolderRow} }"
 
@@ -205,6 +271,7 @@ function Invoke-ParallelFolderScan {
 
         $ps.AddScript($fnAddContentSafe) | Out-Null
         $ps.AddScript($fnGetFolderDepth) | Out-Null
+        $ps.AddScript($fnGetFileTypeCat) | Out-Null
         $ps.AddScript($fnGetRecursive)   | Out-Null
         $ps.AddScript($fnGetFolderRow)   | Out-Null
 
@@ -242,9 +309,10 @@ function Invoke-ParallelFolderScan {
                     }
                 }
 
-                $line = '"{0}","{1}",{2},{3},{4},{5},"{6}"' -f `
+                $line = '"{0}","{1}",{2},{3},{4},{5},"{6}",{7},{8},{9},{10}' -f `
                     $row.FolderPath, $row.RelativePath, $row.Depth,
-                    $row.Files, $row.Subfolders, $row.SizeMB, $row.CountType
+                    $row.Files, $row.Subfolders, $row.SizeMB, $row.CountType,
+                    $row.PDF, $row.COM, $row.OpenXML, $row.Other
                 Add-ContentSafe -Path $OutputCsv -Value $line
                 $rowsWritten++
             }

@@ -12,9 +12,50 @@ param(
     [int]$ParallelItems = 8
 )
 
+# ---------------------------------------------------------------------------
+# Resolve-UNCPath
+# If $Path begins with a drive letter that is a mapped network drive
+# (Win32_LogicalDisk DriveType 4), substitutes the UNC root in place of
+# the drive letter, preserving any subpath beyond the letter. Local/fixed
+# drives, already-UNC paths, or drives that fail to resolve are returned
+# unchanged.
+# ---------------------------------------------------------------------------
+function Resolve-UNCPath {
+    param([string]$Path)
+
+    if ($Path -match '^([A-Za-z]):(\\.*)?$') {
+        $driveLetter = $matches[1] + ':'
+        $remainder   = $matches[2]
+
+        try {
+            $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$driveLetter'" -ErrorAction Stop
+            if ($disk -and $disk.DriveType -eq 4 -and -not [string]::IsNullOrEmpty($disk.ProviderName)) {
+                $uncRoot = $disk.ProviderName.TrimEnd('\')
+                if ([string]::IsNullOrEmpty($remainder)) {
+                    return "$uncRoot\"
+                }
+                else {
+                    return "$uncRoot$remainder"
+                }
+            }
+        }
+        catch {
+            Write-Warning "Could not query mapping for drive '$driveLetter': $($_.Exception.Message)"
+        }
+    }
+
+    return $Path
+}
+
 if (-not (Test-Path -LiteralPath $DrivePath -PathType Container)) {
     Write-Error "DrivePath '$DrivePath' does not exist or is not accessible. Aborting."
     Exit 1
+}
+
+$resolvedDrivePath = Resolve-UNCPath -Path $DrivePath
+if ($resolvedDrivePath -ne $DrivePath) {
+    Write-Host "Resolved mapped drive '$DrivePath' to UNC path '$resolvedDrivePath'"
+    $DrivePath = $resolvedDrivePath
 }
 
 # ---------------------------------------------------------------------------

@@ -313,9 +313,9 @@ function ConvertTo-AmbiguousDateTime {
             $result.Value = $dtUs
         }
         else {
-            # genuinely ambiguous (day <= 12 in both positions) — default to
-            # US, flag for review
-            $result.Value = $dtUs
+            # genuinely ambiguous (day <= 12 in both positions) — leave
+            # NULL rather than guess, flag for manual review
+            $result.Value = $null
             $result.Ambiguous = $true
         }
     }
@@ -386,6 +386,8 @@ function Import-AddPropertiesStatusFile {
         if ($start.ParseFailed) {
             $dr["StartTime"] = [DBNull]::Value
             $failedCount++
+        } elseif ($null -eq $start.Value) {
+            $dr["StartTime"] = [DBNull]::Value
         } else {
             $dr["StartTime"] = $start.Value
         }
@@ -397,6 +399,8 @@ function Import-AddPropertiesStatusFile {
         if ($end.ParseFailed) {
             $dr["EndTime"] = [DBNull]::Value
             $failedCount++
+        } elseif ($null -eq $end.Value) {
+            $dr["EndTime"] = [DBNull]::Value
         } else {
             $dr["EndTime"] = $end.Value
         }
@@ -422,7 +426,7 @@ function Import-AddPropertiesStatusFile {
     }
 
     if ($ambiguousCount -gt 0) {
-        Write-Warning "       $ambiguousCount date value(s) in $fileName were ambiguous (US/UK both valid, different results) — defaulted to US, flagged in StartTimeAmbiguous/EndTimeAmbiguous"
+        Write-Warning "       $ambiguousCount date value(s) in $fileName were ambiguous (US/UK both valid, different results) — left NULL, flagged in StartTimeAmbiguous/EndTimeAmbiguous"
     }
     if ($failedCount -gt 0) {
         Write-Warning "       $failedCount date value(s) in $fileName could not be parsed in any known format — set to NULL, flagged in StartTimeParseFailed/EndTimeParseFailed"

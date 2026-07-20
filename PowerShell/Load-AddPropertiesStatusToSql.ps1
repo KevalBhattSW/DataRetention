@@ -272,60 +272,108 @@ WHEN NOT MATCHED THEN
 # (d/M/yyyy) format, or ISO (yyyy-MM-dd). Returns a hashtable:
 #   Value        - parsed [datetime] or $null
 #   ParseFailed  - true if neither culture could parse it
-#   Ambiguous    - true if both cultures parsed it validly but to DIFFERENT
-#                  dates (day <= 12 in both positions) — Value defaults to
-#                  the US interpretation in this case, flagged for review
+#   Ambiguous    - true if both cultures parsed it validly to DIFFERENT dates
+#                  (day <= 12 in both positions). When ReferenceTime is
+#                  supplied (the file's own timestamp), Value is resolved to
+#                  whichever candidate is closer to it. Left NULL only if
+#                  both candidates are exactly equidistant, or no
+#                  ReferenceTime was available.
 # ---------------------------------------------------------------------------
 function ConvertTo-AmbiguousDateTime {
-    param([string]$RawValue)
+    param(
+        [string]$RawValue,
+        [DateTime]$ReferenceTime = [DateTime]::MinValue
+    )
 
-    $result = @{ Value = $null; ParseFailed = $true; Ambiguous = $false }
+    $result = @{ Value = $null; ParseFailed = $false; Ambiguous = $false; IsBlank = $true }
 
     if ([string]::IsNullOrWhiteSpace($RawValue)) {
         return $result
     }
 
+    $result.IsBlank = $false
+    $RawValue = $RawValue.Trim()
+
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
-    $styles    = [System.Globalization.DateTimeStyles]::None
+    $styles    = [System.Globalization.DateTimeStyles]::AllowWhiteSpaces
 
-    $isoFormats = @("yyyy-MM-dd HH:mm:ss", "yyyy-MM-ddTHH:mm:ss")
-    $usFormats  = @("M/d/yyyy H:mm:ss", "MM/dd/yyyy HH:mm:ss")
-    $ukFormats  = @("d/M/yyyy H:mm:ss", "dd/MM/yyyy HH:mm:ss")
-
-    # ISO first — unambiguous, so if it matches we're done
-    $dtIso = New-Object DateTime
-    if ([datetime]::TryParseExact($RawValue, $isoFormats, $invariant, $styles, [ref]$dtIso)) {
-        $result.Value = $dtIso
-        $result.ParseFailed = $false
+    # ISO-style (yyyy-MM-dd...) is unambiguous — use general TryParse rather
+    # than an exact literal pattern match. TryParse recognizes the ISO
+    # sortable pattern natively and tolerates minor formatting variation
+    # (single- vs double-digit components, odd whitespace, etc.).
+    if ($RawValue -match '^\d{4}-\d{1,2}-\d{1,2}') {
+        $dtIso = New-Object DateTime
+        if ([datetime]::TryParse($RawValue, $invariant, $styles, [ref]$dtIso)) {
+            $result.Value = $dtIso
+        }
+        else {
+            $result.ParseFailed = $true
+        }
         return $result
     }
 
+    # Slash-style — genuinely ambiguous between US (M/d/yyyy) and UK (d/M/yyyy).
+    # NOTE: each format is tried individually with the single-format
+    # TryParseExact overload rather than passing an array — the array-format
+    # overload does not bind reliably via PowerShell's method resolution in
+    # this environment and silently fails to match even clearly-valid input.
+    $usFormats = @("M/d/yyyy H:mm:ss", "MM/dd/yyyy HH:mm:ss", "M/d/yyyy h:mm:ss tt", "MM/dd/yyyy hh:mm:ss tt")
+    $ukFormats = @("d/M/yyyy H:mm:ss", "dd/MM/yyyy HH:mm:ss", "d/M/yyyy h:mm:ss tt", "dd/MM/yyyy hh:mm:ss tt")
+
     $dtUs = New-Object DateTime
-    $usOk = [datetime]::TryParseExact($RawValue, $usFormats, $invariant, $styles, [ref]$dtUs)
+    $usOk = $false
+    foreach ($fmt in $usFormats) {
+        if ([datetime]::TryParseExact($RawValue, $fmt, $invariant, $styles, [ref]$dtUs)) {
+            $usOk = $true
+            break
+        }
+    }
 
     $dtUk = New-Object DateTime
-    $ukOk = [datetime]::TryParseExact($RawValue, $ukFormats, $invariant, $styles, [ref]$dtUk)
+    $ukOk = $false
+    foreach ($fmt in $ukFormats) {
+        if ([datetime]::TryParseExact($RawValue, $fmt, $invariant, $styles, [ref]$dtUk)) {
+            $ukOk = $true
+            break
+        }
+    }
 
     if ($usOk -and $ukOk) {
-        $result.ParseFailed = $false
         if ($dtUs -eq $dtUk) {
             # e.g. day > 12 in one slot makes the format unambiguous anyway
             $result.Value = $dtUs
         }
         else {
-            # genuinely ambiguous (day <= 12 in both positions) — leave
-            # NULL rather than guess, flag for manual review
-            $result.Value = $null
+            # genuinely ambiguous (day <= 12 in both positions) — resolve
+            # using proximity to the file's own timestamp, if available
             $result.Ambiguous = $true
+            if ($ReferenceTime -ne [DateTime]::MinValue) {
+                $diffUs = [Math]::Abs(($dtUs - $ReferenceTime).TotalSeconds)
+                $diffUk = [Math]::Abs(($dtUk - $ReferenceTime).TotalSeconds)
+                if ($diffUs -lt $diffUk) {
+                    $result.Value = $dtUs
+                }
+                elseif ($diffUk -lt $diffUs) {
+                    $result.Value = $dtUk
+                }
+                else {
+                    # exact tie — genuinely indeterminate
+                    $result.Value = $null
+                }
+            }
+            else {
+                $result.Value = $null
+            }
         }
     }
     elseif ($usOk) {
         $result.Value = $dtUs
-        $result.ParseFailed = $false
     }
     elseif ($ukOk) {
         $result.Value = $dtUk
-        $result.ParseFailed = $false
+    }
+    else {
+        $result.ParseFailed = $true
     }
 
     return $result
@@ -349,6 +397,22 @@ function Import-AddPropertiesStatusFile {
     $fileName  = Split-Path -Path $FilePath -Leaf
     $csvRows   = Import-Csv -LiteralPath $FilePath -Delimiter '|'
 
+    # Filenames are stamped YYYYMMDD_HHMMSS — use that as a reference point
+    # to resolve ambiguous US/UK dates (pick whichever interpretation is
+    # closer in time to when the file itself was generated).
+    $fileNameReferenceTime = [DateTime]::MinValue
+    if ($fileName -match '(\d{8})_(\d{6})') {
+        $stampText = "$($Matches[1])$($Matches[2])"
+        $stampParsed = New-Object DateTime
+        $stampOk = [datetime]::TryParseExact(
+            $stampText, "yyyyMMddHHmmss",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None, [ref]$stampParsed)
+        if ($stampOk) {
+            $fileNameReferenceTime = $stampParsed
+        }
+    }
+
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add("Filename",              [string])
     [void]$table.Columns.Add("StartTime",             [datetime])
@@ -370,6 +434,8 @@ function Import-AddPropertiesStatusFile {
 
     $ambiguousCount = 0
     $failedCount = 0
+    $sampleFailed = New-Object System.Collections.Generic.List[string]
+    $sampleAmbiguous = New-Object System.Collections.Generic.List[string]
 
     foreach ($row in $csvRows) {
         $dr = $table.NewRow()
@@ -382,31 +448,39 @@ function Import-AddPropertiesStatusFile {
             $dr["SourceFileCreatedUtc"] = [DBNull]::Value
         }
 
-        $start = ConvertTo-AmbiguousDateTime -RawValue $row.StartTime
-        if ($start.ParseFailed) {
-            $dr["StartTime"] = [DBNull]::Value
-            $failedCount++
-        } elseif ($null -eq $start.Value) {
-            $dr["StartTime"] = [DBNull]::Value
-        } else {
+        $start = ConvertTo-AmbiguousDateTime -RawValue $row.StartTime -ReferenceTime $fileNameReferenceTime
+        if ($start.Value) {
             $dr["StartTime"] = $start.Value
+        } else {
+            $dr["StartTime"] = [DBNull]::Value
         }
         $dr["StartTimeParseFailed"] = $start.ParseFailed
         $dr["StartTimeAmbiguous"]   = $start.Ambiguous
-        if ($start.Ambiguous) { $ambiguousCount++ }
-
-        $end = ConvertTo-AmbiguousDateTime -RawValue $row.EndTime
-        if ($end.ParseFailed) {
-            $dr["EndTime"] = [DBNull]::Value
+        if ($start.ParseFailed) {
             $failedCount++
-        } elseif ($null -eq $end.Value) {
-            $dr["EndTime"] = [DBNull]::Value
-        } else {
+            if ($sampleFailed.Count -lt 5) { $sampleFailed.Add("StartTime='$($row.StartTime)'") }
+        }
+        if ($start.Ambiguous) {
+            $ambiguousCount++
+            if ($sampleAmbiguous.Count -lt 5) { $sampleAmbiguous.Add("StartTime='$($row.StartTime)'") }
+        }
+
+        $end = ConvertTo-AmbiguousDateTime -RawValue $row.EndTime -ReferenceTime $fileNameReferenceTime
+        if ($end.Value) {
             $dr["EndTime"] = $end.Value
+        } else {
+            $dr["EndTime"] = [DBNull]::Value
         }
         $dr["EndTimeParseFailed"] = $end.ParseFailed
         $dr["EndTimeAmbiguous"]   = $end.Ambiguous
-        if ($end.Ambiguous) { $ambiguousCount++ }
+        if ($end.ParseFailed) {
+            $failedCount++
+            if ($sampleFailed.Count -lt 5) { $sampleFailed.Add("EndTime='$($row.EndTime)'") }
+        }
+        if ($end.Ambiguous) {
+            $ambiguousCount++
+            if ($sampleAmbiguous.Count -lt 5) { $sampleAmbiguous.Add("EndTime='$($row.EndTime)'") }
+        }
 
         $parsedSize = 0L
         if ([int64]::TryParse($row.Filesize, [ref]$parsedSize)) {
@@ -426,10 +500,12 @@ function Import-AddPropertiesStatusFile {
     }
 
     if ($ambiguousCount -gt 0) {
-        Write-Warning "       $ambiguousCount date value(s) in $fileName were ambiguous (US/UK both valid, different results) — left NULL, flagged in StartTimeAmbiguous/EndTimeAmbiguous"
+        Write-Warning "       $ambiguousCount date value(s) in $fileName were ambiguous (US/UK both valid, different results) — resolved using proximity to the file's timestamp, flagged in StartTimeAmbiguous/EndTimeAmbiguous"
+        Write-Warning "       sample: $($sampleAmbiguous -join '; ')"
     }
     if ($failedCount -gt 0) {
         Write-Warning "       $failedCount date value(s) in $fileName could not be parsed in any known format — set to NULL, flagged in StartTimeParseFailed/EndTimeParseFailed"
+        Write-Warning "       sample: $($sampleFailed -join '; ')"
     }
 
     if ($table.Rows.Count -eq 0) {
@@ -458,7 +534,7 @@ try {
     Write-Host "Ensuring tables [$SchemaName].[$DataTable] and [$SchemaName].[$LogTable] exist..."
     Initialize-Tables -Connection $connection -Schema $SchemaName -DataTbl $DataTable -LogTbl $LogTable
 
-    $sourceFiles = Get-ChildItem -LiteralPath $ReportsPath -Filter $FileFilter -File
+    $sourceFiles = Get-ChildItem -LiteralPath $ReportsPath -Filter $FileFilter -File -Recurse
     if ($sourceFiles.Count -eq 0) {
         Write-Host "No files matching '$FileFilter' found in $ReportsPath"
         return

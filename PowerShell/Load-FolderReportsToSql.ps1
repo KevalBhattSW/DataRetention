@@ -158,21 +158,51 @@ END;
 }
 
 # ---------------------------------------------------------------------------
-# Check whether a file has already been successfully loaded
+# Determine load status for a file: New, Unchanged, or Changed
+# (Changed = same filename previously loaded successfully, but content hash
+#  now differs — e.g. the file was overwritten mid-run)
 # ---------------------------------------------------------------------------
-function Test-FileAlreadyLoaded {
+function Get-FileLoadStatus {
     param(
         [System.Data.SqlClient.SqlConnection]$Connection,
         [string]$Schema,
         [string]$LogTbl,
+        [string]$FileName,
+        [string]$CurrentHash
+    )
+
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = "SELECT TOP 1 FileHash FROM [$Schema].[$LogTbl] WHERE FileName = @FileName AND Status = 'Success'"
+    $cmd.Parameters.AddWithValue("@FileName", $FileName) | Out-Null
+    $existingHash = $cmd.ExecuteScalar()
+
+    if ($null -eq $existingHash -or $existingHash -is [DBNull]) {
+        return "New"
+    }
+    elseif ($existingHash -eq $CurrentHash) {
+        return "Unchanged"
+    }
+    else {
+        return "Changed"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Delete previously loaded rows for a file (used when the file's content
+# has changed since it was last loaded, so we can reload it cleanly)
+# ---------------------------------------------------------------------------
+function Remove-PreviousFileRows {
+    param(
+        [System.Data.SqlClient.SqlConnection]$Connection,
+        [string]$Schema,
+        [string]$DataTbl,
         [string]$FileName
     )
 
     $cmd = $Connection.CreateCommand()
-    $cmd.CommandText = "SELECT COUNT(1) FROM [$Schema].[$LogTbl] WHERE FileName = @FileName AND Status = 'Success'"
+    $cmd.CommandText = "DELETE FROM [$Schema].[$DataTbl] WHERE SourceFile = @FileName"
     $cmd.Parameters.AddWithValue("@FileName", $FileName) | Out-Null
-    $count = [int]$cmd.ExecuteScalar()
-    return ($count -gt 0)
+    return $cmd.ExecuteNonQuery()
 }
 
 # ---------------------------------------------------------------------------
@@ -211,7 +241,8 @@ WHEN NOT MATCHED THEN
     $cmd.Parameters.AddWithValue("@FileHash", $FileHash) | Out-Null
     $cmd.Parameters.AddWithValue("@RowsLoaded", $RowsLoaded) | Out-Null
     $cmd.Parameters.AddWithValue("@Status", $Status) | Out-Null
-    $cmd.Parameters.AddWithValue("@ErrorMessage", [object]($ErrorMessage ?? [DBNull]::Value)) | Out-Null
+    $errMsgValue = if ($ErrorMessage) { $ErrorMessage } else { [DBNull]::Value }
+    $cmd.Parameters.AddWithValue("@ErrorMessage", $errMsgValue) | Out-Null
     $cmd.ExecuteNonQuery() | Out-Null
 }
 
@@ -289,20 +320,28 @@ try {
 
     $loaded  = 0
     $skipped = 0
+    $reloaded = 0
     $failed  = 0
 
     foreach ($file in $csvFiles) {
 
-        $alreadyLoaded = Test-FileAlreadyLoaded -Connection $connection -Schema $SchemaName `
-                            -LogTbl $LogTable -FileName $file.Name
+        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
 
-        if ($alreadyLoaded) {
-            Write-Host "SKIP   $($file.Name) — already loaded"
+        $status = Get-FileLoadStatus -Connection $connection -Schema $SchemaName `
+                    -LogTbl $LogTable -FileName $file.Name -CurrentHash $hash
+
+        if ($status -eq "Unchanged") {
+            Write-Host "SKIP   $($file.Name) — already loaded, unchanged"
             $skipped++
             continue
         }
 
-        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        if ($status -eq "Changed") {
+            Write-Host "RELOAD $($file.Name) — content changed since last load, removing old rows"
+            $removed = Remove-PreviousFileRows -Connection $connection -Schema $SchemaName `
+                            -DataTbl $DataTable -FileName $file.Name
+            Write-Host "       removed $removed previously loaded row(s)"
+        }
 
         try {
             $rowCount = Import-FolderReportCsv -Connection $connection -Schema $SchemaName `
@@ -312,8 +351,14 @@ try {
                 -FileName $file.Name -FullPath $file.FullName -FileHash $hash `
                 -RowsLoaded $rowCount -Status "Success"
 
-            Write-Host "LOADED $($file.Name) — $rowCount rows"
-            $loaded++
+            if ($status -eq "Changed") {
+                Write-Host "LOADED $($file.Name) — $rowCount rows (reload)"
+                $reloaded++
+            }
+            else {
+                Write-Host "LOADED $($file.Name) — $rowCount rows"
+                $loaded++
+            }
         }
         catch {
             $errMsg = $_.Exception.Message
@@ -327,7 +372,7 @@ try {
     }
 
     Write-Host ""
-    Write-Host "Done. Loaded: $loaded  Skipped: $skipped  Failed: $failed"
+    Write-Host "Done. Loaded: $loaded  Reloaded: $reloaded  Skipped: $skipped  Failed: $failed"
 }
 finally {
     $connection.Close()

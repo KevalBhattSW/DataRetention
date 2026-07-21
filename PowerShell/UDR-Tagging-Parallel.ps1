@@ -12,6 +12,385 @@ if(-not(Test-Path -LiteralPath $DrivePath -PathType Container)) {
     Exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Read-OleStream
+# Reads raw bytes from an OLE stream given its start sector and size,
+# operating entirely from a pre-loaded byte array rather than opening
+# the file again. This avoids repeated network round trips when called
+# multiple times per file.
+# ---------------------------------------------------------------------------
+function Read-OleStream {
+    param(
+        [byte[]]$FileBytes,
+        [int]$StartSector,
+        [int64]$Size,
+        [int]$SectorSize,
+        [System.Collections.Generic.List[int]]$Fat,
+        [int]$MiniCutoff
+    )
+
+    try {
+        $buffer           = New-Object System.Collections.Generic.List[byte]
+        $sector           = $StartSector
+        [int64]$remaining = $Size
+        $visited          = @{}
+
+        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 `
+               -and $remaining -gt 0 -and -not $visited.ContainsKey($sector)) {
+
+            $visited[$sector] = $true
+            $offset = ($sector + 1) * $SectorSize
+
+            if ($offset -ge $FileBytes.Length) { break }
+
+            $toRead = [int][math]::Min($SectorSize, $remaining)
+            $toRead = [int][math]::Min($toRead, $FileBytes.Length - $offset)
+
+            if ($toRead -le 0) { break }
+
+            # Zero-copy add — no intermediate byte array created
+            $buffer.AddRange([System.ArraySegment[byte]]::new($FileBytes, $offset, $toRead))
+            $remaining -= $toRead
+
+            if ($sector -lt $Fat.Count) {
+                $sector = $Fat[$sector]
+            } else {
+                break
+            }
+        }
+
+        return $buffer.ToArray()
+    }
+    catch {
+        return $null
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# Test-LegacyOfficeProtection
+# Detects password-to-open AND password-to-modify in legacy OLE binary
+# Office files (.doc, .xls, .ppt) without opening the file in any Office
+# application.
+#
+# Reads the entire file into memory once, then performs all OLE parsing
+# from that byte array — avoids repeated network file handle operations
+# which caused stalls on network shares when called from parallel runspaces.
+#
+# Write-Verbose lines emit timing at each stage — run with -Verbose or
+# call the script with -Verbose to see them.
+#
+# Returns [PSCustomObject] with:
+#   .IsPasswordToOpen   [bool]
+#   .IsPasswordToModify [bool]
+#   .IsProtected        [bool]  (either of the above)
+#   .Reason             [string]
+# ---------------------------------------------------------------------------
+function Test-LegacyOfficeProtection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $result = [PSCustomObject]@{
+        Path               = $Path
+        IsPasswordToOpen   = $false
+        IsPasswordToModify = $false
+        IsProtected        = $false
+        Reason             = "NoProtection"
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = "FileNotFound"
+        return $result
+    }
+
+    try {
+        # Read entire file into memory once — single network round trip
+        $fileBytes = [System.IO.File]::ReadAllBytes($Path)
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - file read, $($fileBytes.Length) bytes"
+
+        if ($fileBytes.Length -lt 512) {
+            $result.Reason = "FileTooSmall"
+            return $result
+        }
+
+        # Verify OLE signature — loop comparison avoids creating temp array
+        $oleSig   = [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
+        $sigMatch = $true
+        for ($s = 0; $s -lt 8; $s++) {
+            if ($fileBytes[$s] -ne $oleSig[$s]) { $sigMatch = $false; break }
+        }
+        if (-not $sigMatch) {
+            $result.Reason = "NotOLE"
+            return $result
+        }
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - OLE signature confirmed"
+
+        # Parse header fields directly from byte array
+        $sectorShift      = [System.BitConverter]::ToInt16($fileBytes, 0x1E)
+        $sectorSize       = [int][math]::Pow(2, $sectorShift)
+        $miniSectorCutoff = [System.BitConverter]::ToInt32($fileBytes, 0x38)
+        $dirStartSector   = [System.BitConverter]::ToInt32($fileBytes, 0x30)
+        $fatSectorCount   = [System.BitConverter]::ToInt32($fileBytes, 0x2C)
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - header parsed, sectorSize=$sectorSize fatSectorCount=$fatSectorCount dirStartSector=$dirStartSector"
+
+        # Build FAT sector list from DIFAT in header (up to 109 entries at 0x4C)
+        $fatSectorList = @()
+        for ($i = 0; $i -lt [math]::Min(109, $fatSectorCount); $i++) {
+            $sec = [System.BitConverter]::ToInt32($fileBytes, 0x4C + ($i * 4))
+            if ($sec -ge 0) { $fatSectorList += $sec }
+        }
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - FAT sector list: $($fatSectorList -join ',')"
+
+        # Build FAT from byte array
+        $fatData = New-Object System.Collections.Generic.List[int]
+        foreach ($fatSec in $fatSectorList) {
+            $fatOffset        = ($fatSec + 1) * $sectorSize
+            $entriesPerSector = $sectorSize / 4
+            for ($i = 0; $i -lt $entriesPerSector; $i++) {
+                $entryOffset = $fatOffset + ($i * 4)
+                if ($entryOffset + 4 -gt $fileBytes.Length) { break }
+                $fatData.Add([System.BitConverter]::ToInt32($fileBytes, $entryOffset))
+            }
+        }
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - FAT built, $($fatData.Count) entries"
+
+        # Walk directory sector chain and collect stream names
+        # GetString with offset+length avoids creating intermediate byte arrays
+        $streamNames = @{}
+        $sector      = $dirStartSector
+        $visited     = @{}
+        $dirIter     = 0
+
+        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 `
+               -and -not $visited.ContainsKey($sector) -and $dirIter -lt 10000) {
+            $dirIter++
+
+            $visited[$sector] = $true
+            $sectorOffset     = ($sector + 1) * $sectorSize
+
+            if ($sectorOffset + $sectorSize -gt $fileBytes.Length) { break }
+
+            $entryCount = $sectorSize / 128
+
+            for ($e = 0; $e -lt $entryCount; $e++) {
+                $offset    = $sectorOffset + ($e * 128)
+                $nameLen   = [System.BitConverter]::ToInt16($fileBytes, $offset + 64)
+                $entryType = $fileBytes[$offset + 66]
+
+                if ($entryType -gt 0 -and $nameLen -gt 0 -and ($offset + $nameLen) -le $fileBytes.Length) {
+                    # GetString with offset/length — no intermediate byte array
+                    $name       = [System.Text.Encoding]::Unicode.GetString($fileBytes, $offset, $nameLen).TrimEnd([char]0)
+                    $streamSize = [int64][System.BitConverter]::ToUInt32($fileBytes, $offset + 120)
+                    $startSec   = [System.BitConverter]::ToInt32($fileBytes, $offset + 116)
+                    $streamNames[$name] = [PSCustomObject]@{
+                        Size  = $streamSize
+                        Start = $startSec
+                        Type  = $entryType
+                    }
+                }
+            }
+
+            if ($sector -lt $fatData.Count) {
+                $sector = $fatData[$sector]
+            } else {
+                break
+            }
+        }
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - directory walk complete ($dirIter iterations), streams: $($streamNames.Keys -join ', ')"
+
+        # ---------------------------------------------------------------
+        # PASSWORD-TO-OPEN: EncryptedPackage / EncryptionInfo streams
+        # ---------------------------------------------------------------
+        if ($streamNames.ContainsKey("EncryptedPackage") -or $streamNames.ContainsKey("EncryptionInfo")) {
+            $result.IsPasswordToOpen = $true
+            $result.IsProtected      = $true
+            $result.Reason           = "EncryptedToOpen"
+            Write-Verbose "$($sw.Elapsed.TotalSeconds)s - EncryptedToOpen detected"
+            return $result
+        }
+
+        $extension = [System.IO.Path]::GetExtension($Path).ToLower()
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - checking extension: $extension"
+
+        switch ($extension) {
+
+            # ---------------------------------------------------------------
+            # WORD .doc
+            # ---------------------------------------------------------------
+            ".doc" {
+                if ($streamNames.ContainsKey("WordDocument")) {
+                    $si       = $streamNames["WordDocument"]
+                    Write-Verbose "$($sw.Elapsed.TotalSeconds)s - reading WordDocument stream: Start=$($si.Start) Size=$($si.Size)"
+                    $rawBytes = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
+                                               -Size $si.Size -SectorSize $sectorSize `
+                                               -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Write-Verbose "$($sw.Elapsed.TotalSeconds)s - WordDocument stream read: $(if ($rawBytes) { $rawBytes.Length } else { 'NULL' }) bytes"
+
+                    if ($rawBytes -ne $null -and $rawBytes.Length -ge 14) {
+                        $fibFlags = [System.BitConverter]::ToUInt16($rawBytes, 10)
+                        $wRsrvd   = [System.BitConverter]::ToUInt16($rawBytes, 12)
+                        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - fibFlags=0x$( '{0:X4}' -f $fibFlags)  wRsrvd=0x$( '{0:X4}' -f $wRsrvd)"
+                        if (($fibFlags -band 0x0080) -or $wRsrvd -ne 0) {
+                            $result.IsPasswordToModify = $true
+                            $result.IsProtected        = $true
+                            $result.Reason             = "WriteReservedDoc"
+                        }
+                    }
+                }
+            }
+
+# ---------------------------------------------------------------
+            # EXCEL .xls
+            # ---------------------------------------------------------------
+            ".xls" {
+                $streamName = if ($streamNames.ContainsKey("Workbook")) { "Workbook" } else { "Book" }
+                Write-Verbose "$($sw.Elapsed.TotalSeconds)s - XLS stream: '$streamName'  found=$($streamNames.ContainsKey($streamName))"
+                if ($streamNames.ContainsKey($streamName)) {
+                    $si       = $streamNames[$streamName]
+                    Write-Verbose "$($sw.Elapsed.TotalSeconds)s - reading stream: Start=$($si.Start) Size=$($si.Size)"
+                    $rawBytes = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
+                                               -Size $si.Size -SectorSize $sectorSize `
+                                               -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Write-Verbose "$($sw.Elapsed.TotalSeconds)s - stream read: $(if ($rawBytes) { $rawBytes.Length } else { 'NULL' }) bytes"
+
+                    if ($rawBytes -ne $null) {
+                        $i        = 0
+                        $recCount = 0
+                        $maxRecs  = 100000
+
+                        while ($i -lt ($rawBytes.Length - 4) -and $recCount -lt $maxRecs) {
+                            $recCount++
+                            $recType = [System.BitConverter]::ToUInt16($rawBytes, $i)
+                            $recLen  = [System.BitConverter]::ToUInt16($rawBytes, $i + 2)
+
+                            if ($recType -eq 0x002F) {
+                                Write-Verbose "$($sw.Elapsed.TotalSeconds)s - FilePass record at offset $i"
+                                $result.IsPasswordToOpen = $true
+                                $result.IsProtected      = $true
+                                $result.Reason           = "EncryptedToOpen"
+                                break
+                            }
+                            if ($recType -eq 0x005C -and $recLen -ge 4) {
+                                $fReadOnly = [System.BitConverter]::ToUInt16($rawBytes, $i + 4)
+                                $pwHash    = [System.BitConverter]::ToUInt16($rawBytes, $i + 6)
+                                Write-Verbose "$($sw.Elapsed.TotalSeconds)s - FileSharing: fReadOnly=$fReadOnly pwHash=0x$( '{0:X4}' -f $pwHash)"
+                                if ($pwHash -ne 0 -and $fReadOnly -eq 0) {
+                                    $result.IsPasswordToModify = $true
+                                    $result.IsProtected        = $true
+                                    $result.Reason             = "WriteReservedXls"
+                                }
+                                break  # always break after FileSharing — found what we need
+                            }
+
+                            $i += 4 + $recLen
+                            if ($recLen -eq 0 -and $recType -eq 0) { break }
+                        }
+                        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - XLS record scan complete, $recCount records"
+                    }
+                }
+            }
+
+            # ---------------------------------------------------------------
+            # POWERPOINT .ppt
+            # ---------------------------------------------------------------
+            ".ppt" {
+                $validFirstRecTypes = @(0x03E8, 0x0FF0, 0x0FF3, 0x0FF4, 0x07E5, 0x0FA0)
+
+                # Check HeaderToken in Current User mini-stream
+                if ($streamNames.ContainsKey("Root Entry")) {
+                    $rootEntry = $streamNames["Root Entry"]
+                    if ($rootEntry.Start -ge 0 -and $rootEntry.Start -ne -2) {
+                        $miniBytes = Read-OleStream -FileBytes $fileBytes -StartSector $rootEntry.Start `
+                                                    -Size $rootEntry.Size -SectorSize $sectorSize `
+                                                    -Fat $fatData -MiniCutoff $miniSectorCutoff
+                        if ($miniBytes -ne $null -and $miniBytes.Length -ge 16) {
+                            $headerToken = [System.BitConverter]::ToUInt32($miniBytes, 12)
+                            Write-Verbose "$($sw.Elapsed.TotalSeconds)s - PPT HeaderToken: 0x$( '{0:X8}' -f $headerToken)"
+                            if ($headerToken -eq 0xF3D1C4DF) {
+                                $result.IsPasswordToOpen = $true
+                                $result.IsProtected      = $true
+                                $result.Reason           = "EncryptedToOpen_PPT_CurrentUser"
+                            }
+                        }
+                    }
+                }
+
+                # Check PowerPoint Document stream first record type
+                if (-not $result.IsPasswordToOpen -and $streamNames.ContainsKey("PowerPoint Document")) {
+                    $si       = $streamNames["PowerPoint Document"]
+                    $rawFirst = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
+                                               -Size ([math]::Min($si.Size, 8)) -SectorSize $sectorSize `
+                                               -Fat $fatData -MiniCutoff $miniSectorCutoff
+
+                    if ($rawFirst -ne $null -and $rawFirst.Length -ge 8) {
+                        $firstRecType = [System.BitConverter]::ToUInt16($rawFirst, 2)
+                        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - PPT first recType: 0x$( '{0:X4}' -f $firstRecType)"
+                        if ($validFirstRecTypes -notcontains $firstRecType) {
+                            $result.IsPasswordToOpen = $true
+                            $result.IsProtected      = $true
+                            $result.Reason           = "EncryptedToOpen_PPT_StreamGarbled"
+                        }
+                    }
+                }
+
+                # Password-to-modify: scan for WriteAccessAtom (0x03EF)
+                if (-not $result.IsPasswordToOpen -and $streamNames.ContainsKey("PowerPoint Document")) {
+                    $si      = $streamNames["PowerPoint Document"]
+                    $rawFull = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
+                                              -Size $si.Size -SectorSize $sectorSize `
+                                              -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Write-Verbose "$($sw.Elapsed.TotalSeconds)s - PPT full stream: $(if ($rawFull) { $rawFull.Length } else { 'NULL' }) bytes"
+
+                    if ($rawFull -ne $null) {
+                        $i             = 0
+                        $maxIterations = 10000
+                        $iteration     = 0
+
+                        while ($i -lt ($rawFull.Length - 8) -and $iteration -lt $maxIterations) {
+                            $iteration++
+                            $recVer  = $rawFull[$i] -band 0x0F
+                            $recType = [System.BitConverter]::ToUInt16($rawFull, $i + 2)
+                            $recLen  = [System.BitConverter]::ToUInt32($rawFull, $i + 4)
+
+                            if ($recType -eq 0x03EF) {
+                                $flagByte = if (($i + 8) -lt $rawFull.Length) { $rawFull[$i + 8] } else { 0 }
+                                Write-Verbose "$($sw.Elapsed.TotalSeconds)s - WriteAccessAtom at offset $i, flagByte=$flagByte"
+                                if ($flagByte -eq 0x01) {
+                                    $result.IsPasswordToModify = $true
+                                    $result.IsProtected        = $true
+                                    $result.Reason             = "WriteReservedPpt"
+                                }
+                                break
+                            }
+
+                            if ($recVer -eq 0x0F) {
+                                $i += 8
+                            } else {
+                                if ($recLen -gt ($rawFull.Length - $i - 8)) { break }
+                                $i += 8 + [int]$recLen
+                            }
+                        }
+                        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - PPT scan complete, $iteration iterations"
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $result.Reason = "ReadError: $($_.Exception.Message)"
+        Write-Verbose "$($sw.Elapsed.TotalSeconds)s - EXCEPTION: $($_.Exception.Message)"
+    }
+
+    $sw.Stop()
+    Write-Verbose "$($sw.Elapsed.TotalSeconds)s - returning $($result.Reason)"
+    return $result
+}
+
 function Test-LegacyOfficeProtectionDiagnostic {
     param(
         [Parameter(Mandatory)]
@@ -138,12 +517,12 @@ function Test-LegacyOfficeProtectionDiagnostic {
                 if ($streamNames.ContainsKey("WordDocument")) {
                     $si  = $streamNames["WordDocument"]
                     Add-Content $log "WordDocument stream: Start=$($si.Start) Size=$($si.Size)"
-                    $raw = Read-OleStream -Path $Path -StartSector $si.Start -Size $si.Size -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
-                    Add-Content $log "WordDocument raw bytes returned: $(if ($null -eq $raw) { 'NULL' } else { $raw.Length })"
-                    if ($raw -ne $null -and $raw.Length -ge 12) {
-                        $fibFlags = [System.BitConverter]::ToUInt16($raw, 10)
+                    $rawBytes = Read-OleStream -Path $Path -StartSector $si.Start -Size $si.Size -SectorSize $sectorSize -Fat $fatData -MiniCutoff $miniSectorCutoff
+                    Add-Content $log "WordDocument raw bytes returned: $(if ($null -eq $raw) { 'NULL' } else { $rawBytes.Length })"
+                    if ($rawBytes -ne $null -and $rawBytes.Length -ge 14) {
+                        $wRsvrd = [System.BitConverter]::ToUInt16($rawBytes, 12)
                         Add-Content $log "FIB flags word (offset 10): 0x$('{0:X4}' -f $fibFlags)  fWriteReservation bit (0x0080): $(($fibFlags -band 0x0080) -ne 0)"
-                        if ($fibFlags -band 0x0080) {
+                        if ($fibFlags -band 0x0080 -or $wRsvrd -ne 0) {
                             $result.IsPasswordToModify = $true
                             $result.IsProtected        = $true
                             $result.Reason             = "WriteReservedDoc"
@@ -284,347 +663,7 @@ function Test-LegacyOfficeProtectionDiagnostic {
     return $result
 }
 
-# ---------------------------------------------------------------------------
-# Test-LegacyOfficeProtection
-# Detects password-to-open AND password-to-modify in legacy OLE binary
-# Office files (.doc, .xls, .ppt) without opening the file in any Office
-# application.
-#
-# Reads the entire file into memory once, then performs all OLE parsing
-# from that byte array — avoids repeated network file handle operations
-# which caused stalls on network shares when called from parallel runspaces.
-#
-# Returns [PSCustomObject] with:
-#   .IsPasswordToOpen   [bool]
-#   .IsPasswordToModify [bool]
-#   .IsProtected        [bool]  (either of the above)
-#   .Reason             [string]
-# ---------------------------------------------------------------------------
-function Test-LegacyOfficeProtection {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
- 
-    $result = [PSCustomObject]@{
-        Path               = $Path
-        IsPasswordToOpen   = $false
-        IsPasswordToModify = $false
-        IsProtected        = $false
-        Reason             = "NoProtection"
-    }
- 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        $result.Reason = "FileNotFound"
-        return $result
-    }
- 
-    try {
-        # Read entire file into memory once — single network round trip
-        $fileBytes = [System.IO.File]::ReadAllBytes($Path)
- 
-        if ($fileBytes.Length -lt 512) {
-            $result.Reason = "FileTooSmall"
-            return $result
-        }
- 
-        # Verify OLE signature from byte array
-        $oleSig = [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
-        if (($fileBytes[0..7] -join ',') -ne ($oleSig -join ',')) {
-            $result.Reason = "NotOLE"
-            return $result
-        }
- 
-        # Parse header fields directly from byte array
-        $sectorShift      = [System.BitConverter]::ToInt16($fileBytes, 0x1E)
-        $sectorSize       = [int][math]::Pow(2, $sectorShift)
-        $miniSectorCutoff = [System.BitConverter]::ToInt32($fileBytes, 0x38)
-        $dirStartSector   = [System.BitConverter]::ToInt32($fileBytes, 0x30)
-        $fatSectorCount   = [System.BitConverter]::ToInt32($fileBytes, 0x2C)
- 
-        # Build FAT sector list from DIFAT in header (up to 109 entries at 0x4C)
-        $fatSectorList = @()
-        for ($i = 0; $i -lt [math]::Min(109, $fatSectorCount); $i++) {
-            $sec = [System.BitConverter]::ToInt32($fileBytes, 0x4C + ($i * 4))
-            if ($sec -ge 0) { $fatSectorList += $sec }
-        }
- 
-        # Build FAT from byte array
-        $fatData = New-Object System.Collections.Generic.List[int]
-        foreach ($fatSec in $fatSectorList) {
-            $fatOffset        = ($fatSec + 1) * $sectorSize
-            $entriesPerSector = $sectorSize / 4
-            for ($i = 0; $i -lt $entriesPerSector; $i++) {
-                $entryOffset = $fatOffset + ($i * 4)
-                if ($entryOffset + 4 -gt $fileBytes.Length) { break }
-                $fatData.Add([System.BitConverter]::ToInt32($fileBytes, $entryOffset))
-            }
-        }
- 
-        # Walk directory sector chain and collect stream names
-        $streamNames = @{}
-        $sector      = $dirStartSector
-        $visited     = @{}
- 
-        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 `
-               -and -not $visited.ContainsKey($sector)) {
- 
-            $visited[$sector] = $true
-            $sectorOffset     = ($sector + 1) * $sectorSize
- 
-            if ($sectorOffset + $sectorSize -gt $fileBytes.Length) { break }
- 
-            $entryCount = $sectorSize / 128
- 
-            for ($e = 0; $e -lt $entryCount; $e++) {
-                $offset    = $sectorOffset + ($e * 128)
-                $nameLen   = [System.BitConverter]::ToInt16($fileBytes, $offset + 64)
-                $entryType = $fileBytes[$offset + 66]
- 
-                if ($entryType -gt 0 -and $nameLen -gt 0 -and ($offset + $nameLen) -le $fileBytes.Length) {
-                    $nameBytes  = $fileBytes[$offset..($offset + $nameLen - 1)]
-                    $name       = [System.Text.Encoding]::Unicode.GetString($nameBytes).TrimEnd([char]0)
-                    $streamSize = [int64][System.BitConverter]::ToUInt32($fileBytes, $offset + 120)
-                    $startSec   = [System.BitConverter]::ToInt32($fileBytes, $offset + 116)
-                    $streamNames[$name] = [PSCustomObject]@{
-                        Size  = $streamSize
-                        Start = $startSec
-                        Type  = $entryType
-                    }
-                }
-            }
- 
-            if ($sector -lt $fatData.Count) {
-                $sector = $fatData[$sector]
-            } else {
-                break
-            }
-        }
- 
-        # ---------------------------------------------------------------
-        # PASSWORD-TO-OPEN: EncryptedPackage / EncryptionInfo streams
-        # ---------------------------------------------------------------
-        if ($streamNames.ContainsKey("EncryptedPackage") -or $streamNames.ContainsKey("EncryptionInfo")) {
-            $result.IsPasswordToOpen = $true
-            $result.IsProtected      = $true
-            $result.Reason           = "EncryptedToOpen"
-            return $result
-        }
- 
-        $extension = [System.IO.Path]::GetExtension($Path).ToLower()
- 
-        switch ($extension) {
- 
-            # ---------------------------------------------------------------
-            # WORD .doc
-            # ---------------------------------------------------------------
-            ".doc" {
-                if ($streamNames.ContainsKey("WordDocument")) {
-                    $si       = $streamNames["WordDocument"]
-                    $rawBytes = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
-                                               -Size $si.Size -SectorSize $sectorSize `
-                                               -Fat $fatData -MiniCutoff $miniSectorCutoff
- 
-                    if ($rawBytes -ne $null -and $rawBytes.Length -ge 14) {
-                        $fibFlags = [System.BitConverter]::ToUInt16($rawBytes, 10)
-                        $wRsrvd   = [System.BitConverter]::ToUInt16($rawBytes, 12)
-                        # fWriteReservation flag OR non-zero write-reservation hash
-                        if (($fibFlags -band 0x0080) -or $wRsrvd -ne 0) {
-                            $result.IsPasswordToModify = $true
-                            $result.IsProtected        = $true
-                            $result.Reason             = "WriteReservedDoc"
-                        }
-                    }
-                }
-            }
- 
-            # ---------------------------------------------------------------
-            # EXCEL .xls
-            # ---------------------------------------------------------------
-            ".xls" {
-                $streamName = if ($streamNames.ContainsKey("Workbook")) { "Workbook" } else { "Book" }
-                if ($streamNames.ContainsKey($streamName)) {
-                    $si       = $streamNames[$streamName]
-                    $rawBytes = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
-                                               -Size $si.Size -SectorSize $sectorSize `
-                                               -Fat $fatData -MiniCutoff $miniSectorCutoff
- 
-                    if ($rawBytes -ne $null) {
-                        $i = 0
-                        while ($i -lt ($rawBytes.Length - 4)) {
-                            $recType = [System.BitConverter]::ToUInt16($rawBytes, $i)
-                            $recLen  = [System.BitConverter]::ToUInt16($rawBytes, $i + 2)
- 
-                            if ($recType -eq 0x002F) {
-                                # FilePass record = open password
-                                $result.IsPasswordToOpen = $true
-                                $result.IsProtected      = $true
-                                $result.Reason           = "EncryptedToOpen"
-                                break
-                            }
-                            if ($recType -eq 0x005C -and $recLen -ge 4) {
-                                # FileSharing record — check password hash
-                                $pwHash = [System.BitConverter]::ToUInt16($rawBytes, $i + 4 + 2)
-                                if ($pwHash -ne 0) {
-                                    $result.IsPasswordToModify = $true
-                                    $result.IsProtected        = $true
-                                    $result.Reason             = "WriteReservedXls"
-                                }
-                            }
- 
-                            $i += 4 + $recLen
-                            if ($recLen -eq 0 -and $recType -eq 0) { break }
-                        }
-                    }
-                }
-            }
- 
-            # ---------------------------------------------------------------
-            # POWERPOINT .ppt
-            # ---------------------------------------------------------------
-            ".ppt" {
-                $validFirstRecTypes = @(0x03E8, 0x0FF0, 0x0FF3, 0x0FF4, 0x07E5, 0x0FA0)
- 
-                # Check HeaderToken in Current User mini-stream
-                # Root Entry holds the mini-stream container
-                if ($streamNames.ContainsKey("Root Entry")) {
-                    $rootEntry = $streamNames["Root Entry"]
-                    if ($rootEntry.Start -ge 0 -and $rootEntry.Start -ne -2) {
-                        $miniBytes = Read-OleStream -FileBytes $fileBytes -StartSector $rootEntry.Start `
-                                                    -Size $rootEntry.Size -SectorSize $sectorSize `
-                                                    -Fat $fatData -MiniCutoff $miniSectorCutoff
-                        if ($miniBytes -ne $null -and $miniBytes.Length -ge 16) {
-                            $headerToken = [System.BitConverter]::ToUInt32($miniBytes, 12)
-                            if ($headerToken -eq 0xF3D1C4DF) {
-                                $result.IsPasswordToOpen = $true
-                                $result.IsProtected      = $true
-                                $result.Reason           = "EncryptedToOpen_PPT_CurrentUser"
-                            }
-                        }
-                    }
-                }
- 
-                # Check PowerPoint Document stream first record type
-                if (-not $result.IsPasswordToOpen -and $streamNames.ContainsKey("PowerPoint Document")) {
-                    $si       = $streamNames["PowerPoint Document"]
-                    $rawFirst = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
-                                               -Size ([math]::Min($si.Size, 8)) -SectorSize $sectorSize `
-                                               -Fat $fatData -MiniCutoff $miniSectorCutoff
- 
-                    if ($rawFirst -ne $null -and $rawFirst.Length -ge 8) {
-                        $firstRecType = [System.BitConverter]::ToUInt16($rawFirst, 2)
-                        if ($validFirstRecTypes -notcontains $firstRecType) {
-                            $result.IsPasswordToOpen = $true
-                            $result.IsProtected      = $true
-                            $result.Reason           = "EncryptedToOpen_PPT_StreamGarbled"
-                        }
-                    }
-                }
- 
-                # Password-to-modify: scan for WriteAccessAtom (0x03EF)
-                if (-not $result.IsPasswordToOpen -and $streamNames.ContainsKey("PowerPoint Document")) {
-                    $si      = $streamNames["PowerPoint Document"]
-                    $rawFull = Read-OleStream -FileBytes $fileBytes -StartSector $si.Start `
-                                              -Size $si.Size -SectorSize $sectorSize `
-                                              -Fat $fatData -MiniCutoff $miniSectorCutoff
- 
-                    if ($rawFull -ne $null) {
-                        $i             = 0
-                        $maxIterations = 10000
-                        $iteration     = 0
- 
-                        while ($i -lt ($rawFull.Length - 8) -and $iteration -lt $maxIterations) {
-                            $iteration++
-                            $recVer  = $rawFull[$i] -band 0x0F
-                            $recType = [System.BitConverter]::ToUInt16($rawFull, $i + 2)
-                            $recLen  = [System.BitConverter]::ToUInt32($rawFull, $i + 4)
- 
-                            if ($recType -eq 0x03EF) {
-                                $flagByte = if (($i + 8) -lt $rawFull.Length) { $rawFull[$i + 8] } else { 0 }
-                                if ($flagByte -eq 0x01) {
-                                    $result.IsPasswordToModify = $true
-                                    $result.IsProtected        = $true
-                                    $result.Reason             = "WriteReservedPpt"
-                                }
-                                break
-                            }
- 
-                            if ($recVer -eq 0x0F) {
-                                # Container — step into children
-                                $i += 8
-                            } else {
-                                # Atom — skip over entirely
-                                if ($recLen -gt ($rawFull.Length - $i - 8)) { break }
-                                $i += 8 + [int]$recLen
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    catch {
-        $result.Reason = "ReadError: $($_.Exception.Message)"
-    }
- 
-    return $result
-}
 
-# ---------------------------------------------------------------------------
-# Read-OleStream
-# Reads raw bytes from an OLE stream given its start sector and size,
-# operating entirely from a pre-loaded byte array rather than opening
-# the file again. This avoids repeated network round trips when called
-# multiple times per file.
-# ---------------------------------------------------------------------------
-function Read-OleStream {
-    param(
-        [byte[]]$FileBytes,
-        [int]$StartSector,
-        [int64]$Size,
-        [int]$SectorSize,
-        [System.Collections.Generic.List[int]]$Fat,
-        [int]$MiniCutoff
-    )
- 
-    try {
-        $buffer    = New-Object System.Collections.Generic.List[byte]
-        $sector    = $StartSector
-        [int64]$remaining = $Size
-        $visited   = @{}
- 
-        while ($sector -ge 0 -and $sector -ne -2 -and $sector -ne -1 `
-               -and $remaining -gt 0 -and -not $visited.ContainsKey($sector)) {
- 
-            $visited[$sector] = $true
-            $offset = ($sector + 1) * $SectorSize
- 
-            if ($offset -ge $FileBytes.Length) { break }
- 
-            $toRead = [int][math]::Min($SectorSize, $remaining)
-            $toRead = [int][math]::Min($toRead, $FileBytes.Length - $offset)
- 
-            if ($toRead -le 0) { break }
- 
-            $chunk = New-Object byte[] $toRead
-            [System.Array]::Copy($FileBytes, $offset, $chunk, 0, $toRead)
-            $buffer.AddRange($chunk)
-            $remaining -= $toRead
- 
-            if ($sector -lt $Fat.Count) {
-                $sector = $Fat[$sector]
-            } else {
-                break
-            }
-        }
- 
-        return $buffer.ToArray()
-    }
-    catch {
-        return $null
-    }
-}
 
 function Set-OfficeDocCustomProperty {
 	[OutputType([boolean])]
@@ -1368,8 +1407,8 @@ function Add-ContentSafe {
     param(
         [string]$Path,
         [string]$Value,
-        [int]$MaxRetries = 5,
-        [int]$DelayMs = 50
+        [int]$MaxRetries = 20,
+        [int]$DelayMs = 200
     )
 
     for ($i = 0; $i -lt $MaxRetries; $i++) {
@@ -1398,13 +1437,14 @@ function Add-ContentSafe {
 
 #Function to loop through a collection of files, check their age and create/update custom document properties
 function Update-FileAgeProperties {
+    [CmdletBinding()]
     param (
         [System.Collections.ArrayList]$Files,
         [string]$processedFiles,
         [string]$skippedFiles,
         [int]$openXmlParallelItems = 10,
         [int]$pdfParallelItems     = 10,
-        [int]$comParallelItems     = 1,
+        [int]$comParallelItems     = 5,
 
         # Batch trigger thresholds   how many files accumulate in a queue
         # before that queue is dispatched as a batch. This is NOT a
@@ -1537,16 +1577,19 @@ function Update-FileAgeProperties {
 
         if ($comQueue.Count -ge $comBatchTrigger) {
             $comQueueCopy = [System.Collections.ArrayList]@($comQueue)
+            
+            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') Dispatching COM batch of $($comQueueCopy.Count) files"
             $batchResult = Process-ComBatch `
-                -batch            $comQueueCopy `
+                -batch            $comQueue `
                 -metadataDuration $metadataDuration `
                 -processedFiles   $processedFiles `
                 -skippedFiles     $skippedFiles `
                 -filepathProgress $filepathProgress `
                 -filePathLog      $filepath `
                 -parallelItems    $comParallelItems
-
+            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch dispatched, waiting"
             Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
+            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch completed"
             $comQueue.Clear()
             $batchCounter++
         }
@@ -1593,6 +1636,7 @@ function Update-FileAgeProperties {
     }
 
     if ($comQueue.Count -gt 0) {
+        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') Dispatching COM batch of $($comQueue.Count) files"
         $batchResult = Process-ComBatch `
             -batch            $comQueue `
             -metadataDuration $metadataDuration `
@@ -1601,8 +1645,9 @@ function Update-FileAgeProperties {
             -filepathProgress $filepathProgress `
             -filePathLog      $filepath `
             -parallelItems    $comParallelItems
-
+        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch dispatched, waiting"
         Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
+        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch completed"
     }
 
     # Final GC pass at the very end of the run
@@ -1620,30 +1665,38 @@ function Update-FileAgeProperties {
 # buffers stay allocated even after every job in it has completed.
 # ---------------------------------------------------------------------------
 function Wait-AndCollectJobs {
+    [CmdletBinding()]
     param($BatchResult)
 
     $collected = @()
 
     if ($null -eq $BatchResult) { return $collected }
+    $jobIndex = 0
 
     foreach ($job in $BatchResult.Jobs) {
         if ($null -eq $job -or $null -eq $job.Pipe -or $null -eq $job.Handle) { continue }
 
-        $timedOut = -not $job.Handle.AsyncWaitHandle.WaitOne(300000)  # 5 minute timeout
+        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') Waiting on job $jobindex..."
+
+        $timedOut = -not $job.Handle.AsyncWaitHandle.WaitOne(120000)  # 5 minute timeout
         if ($timedOut) {
-            Write-Warning "Runspace timed out after 5 minutes — forcing disposal"
-            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') WARNING: runspace timed out"
-            $job.Pipe.Stop()
-}        try {
-            $output = $job.Pipe.EndInvoke($job.Handle)
-            if ($output) { $collected += $output }
+            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') Job $jobindex TIMED OUT"
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Job $jobindex TIMED OUT"
+            try { $job.Pipe.Stop() } catch {}
         }
-        catch {
-            Write-Warning "Runspace error: $($_.Exception.Message)"
+        else {
+            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') Job $jobindex completed"
+                    
+            try {
+                $output = $job.Pipe.EndInvoke($job.Handle)
+                if ($output) { $collected += $output }
+            }
+            catch {
+                Write-Warning "Runspace error job $jobindex : $($_.Exception.Message)"
+            }
         }
-        finally {
-            $job.Pipe.Dispose()
-        }
+        $job.Pipe.Dispose()
+        $jobIndex++
     }
 
     if ($BatchResult.Pool) {
@@ -1653,7 +1706,7 @@ function Wait-AndCollectJobs {
 
     return $collected
 }
- 
+
  
 
 function Process-PdfBatch{
@@ -2006,8 +2059,6 @@ function Process-COMBatch {
     $fnReadOleStream        = "function Read-OleStream { ${function:Read-OleStream} }"
     $fnTestLegacyProtection = "function Test-LegacyOfficeProtection { ${function:Test-LegacyOfficeProtection} }"
     $fnSetOfficeDoc         = "function Set-OfficeDocCustomProperty { ${function:Set-OfficeDocCustomProperty} }"
-    $fnTestEncrypted        = "function Test-OfficeEncrypted { ${function:Test-OfficeEncrypted} }"
-    $fnTestEncryptedPpt2003 = "function Test-Ppt2003HasOpenPassword { ${function:Test-Ppt2003HasOpenPassword} }"
     $fnAddContentSafe       = "function Add-ContentSafe { ${function:Add-ContentSafe} }"
     $fnHandleError          = "function Handle-FileProcessingError { ${function:Handle-FileProcessingError} }"
     # Write-Log and Write-LogProcess are called by Handle-FileProcessingError - must also be injected
@@ -2025,8 +2076,6 @@ function Process-COMBatch {
         $ps.AddScript($fnWriteLog)             | Out-Null
         $ps.AddScript($fnWriteLogProcess)      | Out-Null
         $ps.AddScript($fnHandleError)          | Out-Null
-        $ps.AddScript($fnTestEncrypted)        | Out-Null
-        $ps.AddScript($fnTestEncryptedPpt2003) | Out-Null
         $ps.AddScript($fnSetOfficeDoc)         | Out-Null
         $ps.AddScript($fnReadOleStream)          | Out-Null
         $ps.AddScript($fnTestLegacyProtection)   | Out-Null 
@@ -2038,7 +2087,7 @@ function Process-COMBatch {
                 $filepathProgress,
                 $format,
                 $filePathLog,
-                $file
+                $filePath
             )
  
             $isError           = $false   # initialise before any branch can reference it
@@ -2049,16 +2098,24 @@ function Process-COMBatch {
             $doc               = $null
  
             # --- Encryption check ---
-            $item = Get-Item -LiteralPath $file   # get item once before the check
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath runspace started"
+            $item = Get-Item -LiteralPath $filePath   # get item once before the check
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath Get-Item complete"
  
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Job starting : $filePath"
             # NEW:
-            $protection = Test-LegacyOfficeProtection -Path $file
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath starting protection check..."
+            $protection = Test-LegacyOfficeProtection -Path $filePath
+            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath protection check complete: $($protection.Reason)"
             if ($protection.IsPasswordToOpen -or $protection.IsPasswordToModify) {
                 $isPasswordProtected = $true
-                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file skipped — $($protection.Reason)"
+                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath skipped — $($protection.Reason)"
             } else {
                 $isPasswordProtected = $false
             } 
+
+            Start-Sleep -Milliseconds 500
+
             $dtLastAccessedDoc = $item.LastAccessTime
             $dtCreated         = $item.CreationTime
             $dtLastModified    = $item.LastWriteTime
@@ -2084,12 +2141,12 @@ function Process-COMBatch {
                                     Write-Error "Word COM object failed to initialise"
                                     $action = Handle-FileProcessingError `
                                         -ErrorRecord      $_ `
-                                        -File             $file `
+                                        -File             $filePath `
                                         -Status           ([ref]$status) `
                                         -App              $app `
                                         -Doc              $doc `
                                         -Item             $item `
-                                        -ObjFile          $file `
+                                        -ObjFile          $filePath `
                                         -ProcessedFiles   $processedFiles `
                                         -SkippedFiles     $skippedFiles `
                                         -LastWriteTime    $dtLastModified `
@@ -2105,31 +2162,31 @@ function Process-COMBatch {
                                 }
                                 else {
 
-                                    $leaf = Split-Path $file -Leaf
+                                    $leaf = Split-Path $filePath -Leaf
                                     $lockName = "~$" + $(if ($leaf.Length -gt 2) { $leaf.Substring(2) } else { $leaf })
-                                    $lockFile = Join-Path (Split-Path $file -Parent) $lockName
+                                    $lockFile = Join-Path (Split-Path $filePath -Parent) $lockName
 
                                     if (Test-Path -LiteralPath $lockfile) {
                                         try {
                                             Remove-Item -LiteralPath $lockFile -force
-                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file removed orphaned lock file $lockFile"
+                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath removed orphaned lock file $lockFile"
                                         }
                                         catch {
                                             Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $ could not remove lock file $lockFile : $($_.Exception.Message)"
                                         }
                                     }
-                                    $doc = $app.Documents.Open($file, $false, $false)
+                                    $doc = $app.Documents.Open($filePath, $false, $false)
                                 }
                             }
                             catch {
                                 $action = Handle-FileProcessingError `
                                     -ErrorRecord      $_ `
-                                    -File             $file `
+                                    -File             $filePath `
                                     -Status           ([ref]$status) `
                                     -App              $app `
                                     -Doc              $doc `
                                     -Item             $item `
-                                    -ObjFile          $file `
+                                    -ObjFile          $filePath `
                                     -ProcessedFiles   $processedFiles `
                                     -SkippedFiles     $skippedFiles `
                                     -LastWriteTime    $dtLastModified `
@@ -2152,22 +2209,24 @@ function Process-COMBatch {
                     "\.xlsx|\.xlsm|\.xls|\.xlsb" {
                         if ($isPasswordProtected -eq $false) {
                             try {
+                                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath creating Excel COM..."
                                 $app = New-Object -ComObject Excel.Application
                                 $app.Visible        = $false
                                 $app.DisplayAlerts  = $false
                                 $app.EnableEvents   = $false
                                 $app.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
+                                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath Excel COM created, opening workbook..."
  
                                 if ($app -eq $null) {
                                     Write-Error "Excel COM object failed to initialise"
                                     $action = Handle-FileProcessingError `
                                         -ErrorRecord      $_ `
-                                        -File             $file `
+                                        -File             $filePath `
                                         -Status           ([ref]$status) `
                                         -App              $app `
                                         -Doc              $doc `
                                         -Item             $item `
-                                        -ObjFile          $file `
+                                        -ObjFile          $filePath `
                                         -ProcessedFiles   $processedFiles `
                                         -SkippedFiles     $skippedFiles `
                                         -LastWriteTime    $dtLastModified `
@@ -2182,31 +2241,32 @@ function Process-COMBatch {
                                     if ($action -eq "ContinueFile") { continue }
                                 }
                                 else {
-                                    $leaf = Split-Path $file -Leaf
+                                    $leaf = Split-Path $filePath -Leaf
                                     $lockName = "~$" + $(if ($leaf.Length -gt 2) { $leaf.Substring(2) } else { $leaf })
-                                    $lockFile = Join-Path (Split-Path $file -Parent) $lockName
+                                    $lockFile = Join-Path (Split-Path $filePath -Parent) $lockName
 
                                     if (Test-Path -LiteralPath $lockfile) {
                                         try {
                                             Remove-Item -LiteralPath $lockFile -force
-                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file removed orphaned lock file $lockFile"
+                                            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath removed orphaned lock file $lockFile"
                                         }
                                         catch {
                                             Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $ could not remove lock file $lockFile : $($_.Exception.Message)"
                                         }
                                     }
-                                    $doc = $app.Workbooks.Open($file, 0, $false)
+                                    $doc = $app.Workbooks.Open($filePath, 0, $false)
+                                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath workbook opened..."
                                 }
                             }
                             catch {
                                 $action = Handle-FileProcessingError `
                                     -ErrorRecord      $_ `
-                                    -File             $file `
+                                    -File             $filePath `
                                     -Status           ([ref]$status) `
                                     -App              $app `
                                     -Doc              $doc `
                                     -Item             $item `
-                                    -ObjFile          $file `
+                                    -ObjFile          $filePath `
                                     -ProcessedFiles   $processedFiles `
                                     -SkippedFiles     $skippedFiles `
                                     -LastWriteTime    $dtLastModified `
@@ -2236,12 +2296,12 @@ function Process-COMBatch {
                                     Write-Error "PowerPoint COM object failed to initialise"
                                     $action = Handle-FileProcessingError `
                                         -ErrorRecord      $_ `
-                                        -File             $file `
+                                        -File             $filePath `
                                         -Status           ([ref]$status) `
                                         -App              $app `
                                         -Doc              $doc `
                                         -Item             $item `
-                                        -ObjFile          $file `
+                                        -ObjFile          $filePath `
                                         -ProcessedFiles   $processedFiles `
                                         -SkippedFiles     $skippedFiles `
                                         -LastWriteTime    $dtLastModified `
@@ -2256,19 +2316,19 @@ function Process-COMBatch {
                                     if ($action -eq "ContinueFile") { continue }
                                 }
                                 else {
-                                    $doc = $app.Presentations.Open($file, $false, $false, $false)
+                                    $doc = $app.Presentations.Open($filePath, $false, $false, $false)
                                     $doc.Saved = $false
                                 }
                             }
                             catch {
                                 $action = Handle-FileProcessingError `
                                     -ErrorRecord      $_ `
-                                    -File             $file `
+                                    -File             $filePath `
                                     -Status           ([ref]$status) `
                                     -App              $app `
                                     -Doc              $doc `
                                     -Item             $item `
-                                    -ObjFile          $file `
+                                    -ObjFile          $filePath `
                                     -ProcessedFiles   $processedFiles `
                                     -SkippedFiles     $skippedFiles `
                                     -LastWriteTime    $dtLastModified `
@@ -2298,7 +2358,7 @@ function Process-COMBatch {
                     $strProperty18Months = if ($blProperty18Months) { "True" } else { "False" }
                     $strProperty3Years   = if ($blProperty3Years)   { "True" } else { "False" }
  
-                    Set-OfficeDocCustomProperty "OriginalPath"         $file                 $doc | Out-Null
+                    Set-OfficeDocCustomProperty "OriginalPath"         $filePath                 $doc | Out-Null
                     Set-OfficeDocCustomProperty "LastAccessed18Months" $strProperty18Months  $doc | Out-Null
                     Set-OfficeDocCustomProperty "Created3Years"        $strProperty3Years    $doc | Out-Null
  
@@ -2310,12 +2370,12 @@ function Process-COMBatch {
                         $status = "Document cannot be saved"
                         $action = Handle-FileProcessingError `
                             -ErrorRecord      $_ `
-                            -File             $file `
+                            -File             $filePath `
                             -Status           ([ref]$status) `
                             -App              $app `
                             -Doc              $doc `
                             -Item             $item `
-                            -ObjFile          $file `
+                            -ObjFile          $filePath `
                             -ProcessedFiles   $processedFiles `
                             -SkippedFiles     $skippedFiles `
                             -LastWriteTime    $dtLastModified `
@@ -2348,12 +2408,12 @@ function Process-COMBatch {
                 $isError = $true
                 $action = Handle-FileProcessingError `
                     -ErrorRecord      $_ `
-                    -File             $file `
+                    -File             $filePath `
                     -Status           ([ref]$status) `
                     -App              $app `
                     -Doc              $doc `
                     -Item             $item `
-                    -ObjFile          $file `
+                    -ObjFile          $filePath `
                     -ProcessedFiles   $processedFiles `
                     -SkippedFiles     $skippedFiles `
                     -LastWriteTime    $dtLastModified `
@@ -2366,7 +2426,7 @@ function Process-COMBatch {
                     -Format           $format `
                     -FileSize         $filesize
  
-                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file exception: $($_.Exception.Message)"
+                Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath exception: $($_.Exception.Message)"
  
                 if ($app -ne $null) {
                     try { $app.Quit() } catch {}
@@ -2396,30 +2456,30 @@ function Process-COMBatch {
                     $restoreMsg = $_.Exception.Message
                     $restoreHR  = if ($_.Exception.HResult) { '{0:X8}' -f $_.Exception.HResult } else { $null }
                     if ($restoreMsg -match 'being used by another process' -or $restoreHR -eq '80070020') {
-                        Write-Warning "Timestamp restore skipped; file in use: $file ($restoreMsg)"
-                        Add-ContentSafe -Path $skippedFiles -Value $file
+                        Write-Warning "Timestamp restore skipped; file in use: $filePath ($restoreMsg)"
+                        Add-ContentSafe -Path $skippedFiles -Value $filePath
                     }
                     else {
-                        Write-Warning "Timestamp restore failed for $file : $restoreMsg (HR=$restoreHR)"
+                        Write-Warning "Timestamp restore failed for $filePath : $restoreMsg (HR=$restoreHR)"
                     }
                 }
  
                 # Log outcome
-                $logEntryProgress = @($file, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected) -Join "|"
+                $logEntryProgress = @($filePath, $startTimeF, $endTimeF, $format, $filesize, $isPasswordProtected) -Join "|"
                 Add-ContentSafe -Path $filepathProgress -Value $logEntryProgress
-                Add-ContentSafe -Path $processedFiles   -Value $file
+                Add-ContentSafe -Path $processedFiles   -Value $filePath
  
                 if ($isPasswordProtected) {
-                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file skipped - password-protected"
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath skipped - password-protected"
                     Write-Output "$file skipped - password-protected"
                 }
                 elseif ($isError) {
-                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties NOT updated - see error above"
-                    Write-Output "$file failed - see log"
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath properties NOT updated - see error above"
+                    Write-Output "$filePath failed - see log"
                 }
                 elseif ($processed) {
-                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file properties updated"
-                    Write-Output "$file properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                    Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $filePath properties updated"
+                    Write-Output "$filePath properties updated at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                 }
             }
  
@@ -2611,7 +2671,7 @@ function Execute_Tagging() {
 		if($filesToScan.Count -ne 0) {
 			$filesToScanUnique = $filesToScan | sort -Unique
 			foreach ($file in $filesToScanUnique) {
-				Add-ContentSafe -Path $TargetFiles -Value $file
+				Add-ContentSafe -Path $TargetFiles -Value $filePath
 			}
 			$continue = $true
 		}
@@ -2746,6 +2806,7 @@ function Stop-KillProcessMonitor {
 
 
 function Invoke-ExecuteTaggingSafely {
+    [CmdletBinding()]
 
     # Start the external monitor process (hidden)
     $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$ScriptPath\KillProcess.log" -ShowWindow -NoExit
@@ -2819,7 +2880,12 @@ function Invoke-ExecuteTaggingSafely {
 
 $global:RpcFailureDetected = $false
 Invoke-ExecuteTaggingSafely -Verbose
+<#
+$testFile = "C:\Users\UDRTagging\Desktop\Doc1.doc"
+$testResult = Test-LegacyOfficeProtection -Path $testFile
 
+WRite-Host "IsProtected =$($testResult.IsProtected) IsPasswordToModify=$($testResult.IsPasswordToModify)"
+#>
 if ($global:RpcFailureDetected) {
     Write-Host "##[error]Restart required due to RPC failure"
     exit 42
@@ -2838,8 +2904,8 @@ Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProce
 # SIG # Begin signature block
 # MIIFjgYJKoZIhvcNAQcCoIIFfzCCBXsCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUZkA3/iA/qCRKQ/qgzbJDJNKZ
-# LX2gggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQU4CUa4CxJx4CuV99awAEHVxPw
+# iP6gggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
 # AQsFADAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZzAeFw0y
 # NjA3MDMxMDAyNTVaFw0zMTA3MDMxMDEyNTFaMCUxIzAhBgNVBAMMGlVEUiBUYWdn
 # aW5nIFNjcmlwdCBTaWduaW5nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
@@ -2859,11 +2925,11 @@ Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProce
 # OTAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZwIQE7EWVmkf
 # AJtDYwn54Vq9kjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKA
 # ADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYK
-# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUJEtkJSLpgfZV3sTWemMsb87kVVMw
-# DQYJKoZIhvcNAQEBBQAEggEASC1kKTaNW6Mq6XcabsxayLmaQaRwNCgVL+hTx28g
-# CEDdY9U7F6M6EfDSWENIHjhcoaMJn3fpli3RqCToqQVxW4IRRFualS2/ND4tE9Ge
-# msTEmn/pEFJnSPzjJE2qwgPQtMOT4gi/CeN0yXVy8GM6iYfm3t03NDgtc7SAfCBZ
-# FHOW/dtPCZkG8+uewA2ntv62lhxSF3Ei+Ty8HipB3sYv4hqxOxFfd5H05DWYAPY2
-# t5Kv+v/LojfE39SVjTVdKoDe08BAkl0iJEa3DAS/2rFK1mfb9Dms834xt7/8eI47
-# 6ONhtOkiSTI/1TijVVgWvS+tLZ83/WeW7Jy4LBDiV30LVA==
+# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUZzyyb36xfO5O/u01NqfOBlM6N3ow
+# DQYJKoZIhvcNAQEBBQAEggEAwQnWa+6SGhYv/L+3v1fBW1Daf5NcewiqK4B86WnA
+# gVXxVSSHG2VYpUNpxCA1n+kWayZ09/VC9aodaFtwqk/8+KoMzAwQSQHD+l8MD/uj
+# L+aJH7LE/u2XTCKXe+I8mK/yuVJrcJny1O3bQT3tagQi+rk3EvCgPQQs2QPLsjjy
+# WKHU0mL4STjW+f7MNveUeTqwJOkdktjag3W5Fz+wD0izPz3Ro9fvOizH+A0W8cS3
+# tOk5ZW6YLqkJygb5ZF6hSc1q9hGNsJSEV7V44PXF3xvpsWpxNO7hDUAvAtn19SIu
+# 9bZB/WeCbsPknmraeIhasQTXj9vWN2sboww6s4XgFZrq0w==
 # SIG # End signature block

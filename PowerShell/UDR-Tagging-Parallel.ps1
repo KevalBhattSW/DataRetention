@@ -1497,7 +1497,7 @@ function Update-FileAgeProperties {
     New-Item -Path $filepath -ItemType File -Force | Out-Null
 
     $batchCounter = 0
-
+	$swTotal = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($file in $Files) {
 
         if ($file -like "*Incentives Newsletter!*.doc") {
@@ -1553,9 +1553,12 @@ function Update-FileAgeProperties {
                 -filePathLog      $filepath `
                 -parallelItems    $openXmlParallelItems
 
-            Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
+			Write-Verbose "$(Get-Date -Format 'HH:mm:ss') OpenXML batch dispatched ($($openXmlQueue.Count) files)"
+	        Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
             $openXmlQueue.Clear()
             $batchCounter++
+			Write-Verbose "$(Get-Date -Format 'HH:mm:ss') OpenXML batch complete — total elapsed: $($swTotal.Elapsed.ToString('hh\:mm\:ss'))"
+			Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') BATCH COMPLETE — elapsed $($swTotal.Elapsed.ToString('hh\:mm\:ss')) files_processed=$($Files.Count)"
         }
 
         if ($pdfQueue.Count -ge $pdfBatchTrigger) {
@@ -1570,9 +1573,12 @@ function Update-FileAgeProperties {
                 -filePathLog      $filepath `
                 -parallelItems    $pdfParallelItems
 
-            Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
+			Write-Verbose "$(Get-Date -Format 'HH:mm:ss') PDF batch dispatched ($($pdfQueue.Count) files)"
+	        Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
             $pdfQueue.Clear()
             $batchCounter++
+			Write-Verbose "$(Get-Date -Format 'HH:mm:ss') PDF batch complete — total elapsed: $($swTotal.Elapsed.ToString('hh\:mm\:ss'))"
+			Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') BATCH COMPLETE — elapsed $($swTotal.Elapsed.ToString('hh\:mm\:ss')) files_processed=$($Files.Count)"
         }
 
         if ($comQueue.Count -ge $comBatchTrigger) {
@@ -1587,11 +1593,12 @@ function Update-FileAgeProperties {
                 -filepathProgress $filepathProgress `
                 -filePathLog      $filepath `
                 -parallelItems    $comParallelItems
-            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch dispatched, waiting"
-            Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
-            Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch completed"
+	        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch dispatched ($($comQueue.Count) files)"
+	        Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
             $comQueue.Clear()
             $batchCounter++
+	        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch complete — total elapsed: $($swTotal.Elapsed.ToString('hh\:mm\:ss'))"
+			Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') BATCH COMPLETE — elapsed $($swTotal.Elapsed.ToString('hh\:mm\:ss')) files_processed=$($Files.Count)"
         }
 
         # --- Periodic GC nudge every 20 batches ---
@@ -1617,8 +1624,10 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $openXmlParallelItems
-
+		Write-Verbose "$(Get-Date -Format 'HH:mm:ss') OpenXML batch dispatched ($($openXmlQueue.Count) files)"
         Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
+		Write-Verbose "$(Get-Date -Format 'HH:mm:ss') OpenXML batch complete — total elapsed: $($swTotal.Elapsed.ToString('hh\:mm\:ss'))"
+		Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') BATCH COMPLETE — elapsed $($swTotal.Elapsed.ToString('hh\:mm\:ss')) files_processed=$($Files.Count)"
     }
 
     if ($pdfQueue.Count -gt 0) {
@@ -1631,8 +1640,10 @@ function Update-FileAgeProperties {
             -format           $format `
             -filePathLog      $filepath `
             -parallelItems    $pdfParallelItems
-
+		Write-Verbose "$(Get-Date -Format 'HH:mm:ss') PDF batch dispatched ($($pdfQueue.Count) files)"
         Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
+		Write-Verbose "$(Get-Date -Format 'HH:mm:ss') PDF batch complete — total elapsed: $($swTotal.Elapsed.ToString('hh\:mm\:ss'))"
+		Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') BATCH COMPLETE — elapsed $($swTotal.Elapsed.ToString('hh\:mm\:ss')) files_processed=$($Files.Count)"
     }
 
     if ($comQueue.Count -gt 0) {
@@ -1645,9 +1656,10 @@ function Update-FileAgeProperties {
             -filepathProgress $filepathProgress `
             -filePathLog      $filepath `
             -parallelItems    $comParallelItems
-        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch dispatched, waiting"
+        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch dispatched ($($comQueue.Count) files)"
         Wait-AndCollectJobs -BatchResult $batchResult | Out-Null
-        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch completed"
+        Write-Verbose "$(Get-Date -Format 'HH:mm:ss') COM batch complete — total elapsed: $($swTotal.Elapsed.ToString('hh\:mm\:ss'))"
+		Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') BATCH COMPLETE — elapsed $($swTotal.Elapsed.ToString('hh\:mm\:ss')) files_processed=$($Files.Count)"
     }
 
     # Final GC pass at the very end of the run
@@ -2671,7 +2683,7 @@ function Execute_Tagging() {
 		if($filesToScan.Count -ne 0) {
 			$filesToScanUnique = $filesToScan | sort -Unique
 			foreach ($file in $filesToScanUnique) {
-				Add-ContentSafe -Path $TargetFiles -Value $filePath
+				Add-ContentSafe -Path $TargetFiles -Value $file
 			}
 			$continue = $true
 		}

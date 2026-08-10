@@ -1374,13 +1374,20 @@ function Set-OpenXmlProperties {
 }
 function Test-FileExists {
     param([string]$fileToTest)
-    if (!(Test-Path -Path $fileToTest -PathType Leaf)) {
-        Write-Error "$fileToTest does not exist."
-        return $false
+    # Retry up to 3 times with a short delay — handles transient network blips
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        if (Test-Path -LiteralPath $fileToTest -PathType Leaf) {
+            return $true
+        }
+        if ($attempt -lt 3) {
+            Start-Sleep -Milliseconds 500
+        }
     }
-    else {
-        return $true
-    }
+    
+    $logPath = "$($env:TEMP)\FileNotFound.log"
+    Write-Warning "$fileToTest does not exist after 3 attempts."
+    Add-ContentSafe -Path $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') NOT FOUND after retries: $fileToTest"
+    return $false
 }
 
 
@@ -1454,9 +1461,9 @@ function Update-FileAgeProperties {
         # just means fewer, larger dispatch/drain cycles   less pool
         # open/close overhead   while parallelItems continues to throttle
         # how many files are actually being worked on at once.
-        [int]$openXmlBatchTrigger = 100,   # was 3
-        [int]$pdfBatchTrigger     = 100,   # was 3
-        [int]$comBatchTrigger     = 30    # was 2
+        [int]$openXmlBatchTrigger = 20,   # was 3
+        [int]$pdfBatchTrigger     = 20,   # was 3
+        [int]$comBatchTrigger     = 10    # was 2
     )
 
     if (!(Test-FileExists -fileToTest $processedFiles)) {
@@ -1497,7 +1504,8 @@ function Update-FileAgeProperties {
     New-Item -Path $filepath -ItemType File -Force | Out-Null
 
     $batchCounter = 0
-	$swTotal = [System.Diagnostics.Stopwatch]::StartNew()
+    $swTotal = [System.Diagnostics.Stopwatch]::StartNew()
+    Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Update-FileAgeProperties started"
     foreach ($file in $Files) {
 
         if ($file -like "*Incentives Newsletter!*.doc") {
@@ -1508,15 +1516,15 @@ function Update-FileAgeProperties {
         Write-Output $file
 
         if (!(Test-FileExists -fileToTest $file)) {
-            Add-ContentSafe -Path $processedFiles -Value $file
+            Add-ContentSafe -Path $skippedFiles -Value $file
             Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file not found"
-            Write-Output "$file file not found so skipped"
+            Write-Output "$file file not found - skipped"
             continue
         }
 
         if (Test-FileLocked -fileToTest $file) {
-            Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file locked/open so skipped"
-            Write-Output "$file file locked/open so skipped"
+            Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file file locked/open - skipped"
+            Write-Output "$file file locked/open - skipped"
             Add-ContentSafe -Path $skippedFiles -Value $file
             continue
         }
@@ -1538,6 +1546,8 @@ function Update-FileAgeProperties {
         }
 
         Add-ContentSafe -Path $filepath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $file queued for property update"
+
+        # --- Batch triggers: dispatch, wait, dispose, close pool   all before continuing ---
 
         # --- Batch triggers: dispatch, wait, dispose, close pool   all before continuing ---
 
@@ -1693,7 +1703,7 @@ function Wait-AndCollectJobs {
         $timedOut = -not $job.Handle.AsyncWaitHandle.WaitOne(120000)  # 5 minute timeout
         if ($timedOut) {
             Write-Verbose "$(Get-Date -Format 'HH:mm:ss') Job $jobindex TIMED OUT"
-            Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Job $jobindex TIMED OUT"
+            #Add-ContentSafe -Path $filePathLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Job $jobindex TIMED OUT"
             try { $job.Pipe.Stop() } catch {}
         }
         else {
@@ -2521,20 +2531,20 @@ function Get-ApplicableFiles {
     [CmdletBinding()]
     [OutputType([System.Collections.ArrayList])]
     param (
-        #[System.Collections.ArrayList]$Files,
-        [string]$FolderName
+        [string]$FolderName,
+        [string]$ErrorLog  = "$ScriptPath\GetApplicableFiles_Errors.log",
+        [string]$FolderLog = "$ScriptPath\GetApplicableFiles_Folders.log"
     )
 
-    # Write-Host "Folder Name --- line 487 inside fucntion -- is: $FolderName"
-
-    # Validate folder
     if (-not (Test-Path -LiteralPath $FolderName -PathType Container)) {
-        Write-Error "Folder '$FolderName' does not exist."
+        Write-Warning "Folder '$FolderName' does not exist."
         return [System.Collections.ArrayList]::new()
     }
 
+    # Log every folder visited
+    Add-ContentSafe -Path $FolderLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') SCANNING: $FolderName"
 
-    # Allowed extensions
+
     $officeExtensions = @(
         ".doc", ".docx", ".docm",
         ".xls", ".xlsx", ".xlsm", ".xlsb",
@@ -2544,9 +2554,9 @@ function Get-ApplicableFiles {
 
     $result = [System.Collections.ArrayList]::new()
 
+    # Process files in current folder
     try {
-        # Process files in current folder
-        Get-ChildItem -LiteralPath $FolderName -File -ErrorAction Stop |
+        Get-ChildItem -LiteralPath $FolderName -File -ErrorAction SilentlyContinue |
         Where-Object {
             $_.LastAccessTime -lt (Get-Date).AddDays(-540) -and
             $_.CreationTime   -lt (Get-Date).AddDays(-1095) -and
@@ -2557,31 +2567,34 @@ function Get-ApplicableFiles {
         ForEach-Object {
             [void]$result.Add($_.FullName)
         }
-
-        # Recurse into subfolders
-        Get-ChildItem -LiteralPath $FolderName -Directory -ErrorAction Stop |
-        ForEach-Object {
-            Write-Verbose "Recursing into subfolder: $($_.FullName)"
-
-            $childResults = Get-ApplicableFiles `
-                -FolderName $_.FullName #`
-                #-LastAccessedMonths $lastAccessedMonthsAbs `
-                #-CreatedMonths $createdMonthsAbs
-
-            foreach ($child in $childResults) {
-                [void]$result.Add($child)
-            }
-        }
     }
     catch {
-        Write-Error "Error processing folder '$FolderName': $($_.Exception.Message)"
+        $msg = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') CANNOT ACCESS FILES in '$FolderName': $($_.Exception.Message)"
+        Write-Warning $msg
+        Add-ContentSafe -Path $ErrorLog -Value $msg
+    }
+
+    # Recurse into subfolders
+    try {
+        $subFolders = Get-ChildItem -LiteralPath $FolderName -Directory -ErrorAction SilentlyContinue
+    }
+    catch {
+        $msg = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') CANNOT ENUMERATE SUBFOLDERS in '$FolderName': $($_.Exception.Message)"
+        Write-Warning $msg
+        Add-ContentSafe -Path $ErrorLog -Value $msg
+        return $result
+    }
+
+    foreach ($subFolder in $subFolders) {
+        Write-Verbose "Recursing into subfolder: $($subFolder.FullName)"
+        $childResults = Get-ApplicableFiles -FolderName $subFolder.FullName -ErrorLog $ErrorLog -FolderLog $FolderLog
+        foreach ($child in $childResults) {
+            [void]$result.Add($child)
+        }
     }
 
     return $result
-
-
 }
-
 
 function Execute_Tagging() {
 	clear
@@ -2621,22 +2634,34 @@ function Execute_Tagging() {
 
 	$filesToScan =[System.Collections.ArrayList]::new()
 	if ($newRun -eq $false) {
-		$targetFilesList = (Get-Content -Path $targetFiles).Trim() 
-		$skippedFilesList = (Get-Content -Path $skippedFiles).Trim()
+		$targetFilesList  = @(Get-Content -Path $targetFiles  | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() }) 
+		$skippedFilesList = @(Get-Content -Path $skippedFiles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
 		$skippedFilesListUnique = $skippedFilesList | sort -Unique
 		if((Get-Item $scannedFiles).Length -ne 0) {
-			$scannedFilesList = (Get-Content -Path $scannedFiles).Trim()
-			foreach ($targetFile in $targetFilesList) {
-				if($scannedFilesList.contains($targetFile)) {
-				    Write-Host "$targetFile has already been scanned"
-				}
-                elseif($skippedFilesListUnique.contains($targetFile)) {
-				    Write-Host "$targetFile has been skipped previously"
-				}
-				else {
-					$filesToScan.Add($targetFile)
-				}
-			}
+			$scannedFilesList = @(Get-Content -Path $scannedFiles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+            $scannedSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $skippedSet  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            foreach ($f in $scannedFilesList)       { $scannedSet.Add($f) | Out-Null }
+            foreach ($f in $skippedFilesListUnique) { $skippedSet.Add($f) | Out-Null }
+
+            $pendingSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            foreach ($targetFile in $targetFilesList) {
+                $t = $targetFile.Trim()
+                if ($scannedSet.Contains($t)) {
+                    Write-Host "$t has already been scanned"
+                }
+                elseif ($skippedSet.Contains($t)) {
+                    Write-Host "$t has been skipped previously"
+                }
+                else {
+                    $pendingSet.Add($t) | Out-Null
+                }
+            }
+
+            $filesToScanUnique = [System.Collections.ArrayList]@($pendingSet)
+            $continue = ($filesToScanUnique.Count -ne 0)
 		}
 		else {
 			$filesToScan = $targetFilesList
@@ -2732,42 +2757,49 @@ function Start-KillProcessMonitor {
     # --- Build the monitor script that runs in the external PowerShell process ---
     $monitorScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
-try {
-    try { `$Host.UI.RawUI.WindowTitle = 'Kill-Process Monitor' } catch {}
-    `"`$(Get-Date -Format o) | External Kill-Process started`" | Out-File -Append '$LogPath'
+`$maxRestarts = 10
+`$restartCount = 0
 
-    `$officeProcesses = @('WINWORD','EXCEL','POWERPNT')
+while (`$restartCount -lt `$maxRestarts) {
+    try {
+        try { `$Host.UI.RawUI.WindowTitle = 'Kill-Process Monitor (restart #`$restartCount)' } catch {}
+        `"`$(Get-Date -Format o) | External Kill-Process started (restart #`$restartCount)`" | Out-File -Append '$LogPath'
 
-    while (`$true) {
-        try {
-            `$now = Get-Date
-            foreach (`$procName in `$officeProcesses) {
-                Get-Process -Name `$procName -ErrorAction SilentlyContinue | ForEach-Object {
-                    `$runtime = `$now - `$_.StartTime
-                    if (`$runtime.TotalSeconds -gt $MaxRuntimeSeconds) {
-                        `"`$(Get-Date -Format o) | Stopping `$(`$_.ProcessName) PID=`$(`$_.Id) Runtime=`$([math]::Round(`$runtime.TotalMinutes,2)) min`" |
-                            Out-File -Append '$LogPath'
-                        Stop-Process -Id `$_.Id -Force -ErrorAction SilentlyContinue
+        `$officeProcesses = @('WINWORD','EXCEL','POWERPNT')
+
+        while (`$true) {
+            try {
+                `$now = Get-Date
+                foreach (`$procName in `$officeProcesses) {
+                    Get-Process -Name `$procName -ErrorAction SilentlyContinue | ForEach-Object {
+                        `$runtime = `$now - `$_.StartTime
+                        if (`$runtime.TotalSeconds -gt $MaxRuntimeSeconds) {
+                            `"`$(Get-Date -Format o) | Stopping `$(`$_.ProcessName) PID=`$(`$_.Id) Runtime=`$([math]::Round(`$runtime.TotalMinutes,2)) min`" |
+                                Out-File -Append '$LogPath'
+                            Stop-Process -Id `$_.Id -Force -ErrorAction SilentlyContinue
+                        }
                     }
                 }
             }
-        }
-        catch {
-            "`$(Get-Date -Format o) | Monitor error: `$(`$_.Exception.Message)" | Out-File -Append '$LogPath'
-            Write-Host "Monitor error: $($_.Exception.Message)" -ForegroundColor Red
-        }
+            catch {
+                `"`$(Get-Date -Format o) | Monitor error: `$(`$_.Exception.Message)`" | Out-File -Append '$LogPath'
+            }
 
-        Start-Sleep -Seconds $CheckIntervalSeconds
+            Start-Sleep -Seconds $CheckIntervalSeconds
+        }
+    }
+    catch {
+        `$restartCount++
+        `"`$(Get-Date -Format o) | Monitor fatal error (restart `$restartCount of `$maxRestarts): `$(`$_.Exception.Message)`" | Out-File -Append '$LogPath'
+        
+        if (`$restartCount -lt `$maxRestarts) {
+            `"`$(Get-Date -Format o) | Restarting monitor in 5 seconds...`" | Out-File -Append '$LogPath'
+            Start-Sleep -Seconds 5
+        }
     }
 }
-catch {
-    "`$(Get-Date -Format o) | Monitor fatal error: `$(`$_.Exception.Message)" | Out-File -Append '$LogPath'
-    Write-Host "Monitor fatal error: $($_.Exception.Message)" -ForegroundColor Red
-    Read-Host "Press Enter to close the monitor..."
-}
-finally {
-    "`$(Get-Date -Format o) | External Kill-Process exiting" | Out-File -Append '$LogPath'
-}
+
+`"`$(Get-Date -Format o) | Monitor exiting after `$maxRestarts restarts`" | Out-File -Append '$LogPath'
 "@
 
     # --- Resolve a console host (prefer Windows PowerShell console for ISE) ---
@@ -2819,7 +2851,7 @@ function Stop-KillProcessMonitor {
 
 function Invoke-ExecuteTaggingSafely {
     [CmdletBinding()]
-
+    $ErrorActionPreference = 'Stop'
     # Start the external monitor process (hidden)
     $monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$ScriptPath\KillProcess.log" -ShowWindow -NoExit
     #$monitorProc = Start-KillProcessMonitor -MaxRuntimeSeconds 60 -CheckIntervalSeconds 15 -LogPath "$($env:LOCALAPPDATA)\Temp\KillProcess.log" -ShowWindow -NoExit
@@ -2835,6 +2867,9 @@ function Invoke-ExecuteTaggingSafely {
         Execute_Tagging
     }
     catch {
+        Write-Host "ERROR at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
+        Write-Host "Script: $($_.InvocationInfo.ScriptName)"
+        Write-Host "Line content: $($_.InvocationInfo.Line.Trim())"        
         $taggingFailed = $true
         Write-Warning ("Execute_Tagging failed (continuing): {0}" -f $_.Exception.Message)
         # Do NOT rethrow if you want the script to continue
@@ -2916,8 +2951,8 @@ Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProce
 # SIG # Begin signature block
 # MIIFjgYJKoZIhvcNAQcCoIIFfzCCBXsCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQU4CUa4CxJx4CuV99awAEHVxPw
-# iP6gggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUlMbfP99QX45y8c3wYmrZYhfc
+# xDOgggMeMIIDGjCCAgKgAwIBAgIQE7EWVmkfAJtDYwn54Vq9kjANBgkqhkiG9w0B
 # AQsFADAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZzAeFw0y
 # NjA3MDMxMDAyNTVaFw0zMTA3MDMxMDEyNTFaMCUxIzAhBgNVBAMMGlVEUiBUYWdn
 # aW5nIFNjcmlwdCBTaWduaW5nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
@@ -2937,11 +2972,11 @@ Add-Content -Path "$($env:LOCALAPPDATA)\temp\debug.txt" "AFTER XML: $fileToProce
 # OTAlMSMwIQYDVQQDDBpVRFIgVGFnZ2luZyBTY3JpcHQgU2lnbmluZwIQE7EWVmkf
 # AJtDYwn54Vq9kjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKA
 # ADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYK
-# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUZzyyb36xfO5O/u01NqfOBlM6N3ow
-# DQYJKoZIhvcNAQEBBQAEggEAwQnWa+6SGhYv/L+3v1fBW1Daf5NcewiqK4B86WnA
-# gVXxVSSHG2VYpUNpxCA1n+kWayZ09/VC9aodaFtwqk/8+KoMzAwQSQHD+l8MD/uj
-# L+aJH7LE/u2XTCKXe+I8mK/yuVJrcJny1O3bQT3tagQi+rk3EvCgPQQs2QPLsjjy
-# WKHU0mL4STjW+f7MNveUeTqwJOkdktjag3W5Fz+wD0izPz3Ro9fvOizH+A0W8cS3
-# tOk5ZW6YLqkJygb5ZF6hSc1q9hGNsJSEV7V44PXF3xvpsWpxNO7hDUAvAtn19SIu
-# 9bZB/WeCbsPknmraeIhasQTXj9vWN2sboww6s4XgFZrq0w==
+# KwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUe5BA+0mjozPb+jIkpqKfQbSbeWMw
+# DQYJKoZIhvcNAQEBBQAEggEAb/WcGtcJKVaibMqQwdxj7P7m0Lzyh45llzStKO9a
+# UlG11T1nqfBC6Zny7IJhlmKwzdmGrc0SJtHEeX3aDozUvVvjcq/Vi6wGio9DqZN5
+# ubiiS+xUoNCtayCnTFGjLTmO5MVM4XFnlmhSRjSQKwiOEYwLCjWH01x7jniY284A
+# k14sv5naxlNXKfylVSXZSbXkekBCyv1IZ/N8Etrfro2u0yIbchqA0xarQYFvZ1vA
+# rA0mYI7vVWBjcCdviZiLio3y6toLBmh8MTRXhN69v9NPvau2GagOLipNHm19HJrw
+# h1a+td/5U/CvHEFTnoEdwlvRjUILKY3P3pRvKstRKh+lIg==
 # SIG # End signature block

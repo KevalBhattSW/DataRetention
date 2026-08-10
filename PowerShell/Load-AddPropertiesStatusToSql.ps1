@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Loads AddPropertiesStatus pipe-delimited (|) files into a SQL Server
     table, skipping files already loaded and reloading any that changed

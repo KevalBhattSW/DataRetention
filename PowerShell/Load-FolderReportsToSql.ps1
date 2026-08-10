@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Loads UDR-FolderReport.ps1 CSV output into a SQL Server table, skipping
     any file that has already been loaded.
@@ -48,13 +48,13 @@
 
 param(
     [Parameter(Mandatory=$true)]
-    [string]$ReportsPath,
+    [string]$ReportsPath = "\\AZUKSWVPUNSD01\Temp\FolderReports",
 
     [Parameter(Mandatory=$true)]
-    [string]$SqlServer,
+    [string]$SqlServer = "LWUKWVNTV25\INS1,11433",
 
     [Parameter(Mandatory=$true)]
-    [string]$Database,
+    [string]$Database = "unstrdata",
 
     [Parameter(Mandatory=$false)]
     [string]$SchemaName = "dbo",
@@ -129,6 +129,10 @@ BEGIN
         Subfolders    INT              NULL,
         SizeMB        DECIMAL(18,2)    NULL,
         CountType     NVARCHAR(20)     NULL,
+        PDF INT NULL,
+        COM INT NULL,
+        [OpenXML] INT NULL,
+        Other INT NULL,
         SourceFile    NVARCHAR(500)    NOT NULL,
         LoadedDateUtc DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME()
     );
@@ -269,6 +273,10 @@ function Import-FolderReportCsv {
     [void]$table.Columns.Add("Subfolders",   [int])
     [void]$table.Columns.Add("SizeMB",       [decimal])
     [void]$table.Columns.Add("CountType",    [string])
+    [void]$table.Columns.Add("PDF",        [int])
+    [void]$table.Columns.Add("COM",        [int])
+    [void]$table.Columns.Add("OpenXML",        [int])
+    [void]$table.Columns.Add("Other",        [int])
     [void]$table.Columns.Add("SourceFile",   [string])
 
     foreach ($row in $csvRows) {
@@ -280,6 +288,10 @@ function Import-FolderReportCsv {
         $dr["Subfolders"]   = [int]$row.Subfolders
         $dr["SizeMB"]       = [decimal]$row.SizeMB
         $dr["CountType"]    = [string]$row.CountType
+        $dr["PDF"]        = [int]$row.PDF
+        $dr["COM"]        = [int]$row.COM
+        $dr["OpenXML"]        = [int]$row.OpenXML
+        $dr["Other"]        = [int]$row.Other
         $dr["SourceFile"]   = $fileName
         [void]$table.Rows.Add($dr)
     }
@@ -310,7 +322,7 @@ try {
     Write-Host "Ensuring tables [$SchemaName].[$DataTable] and [$SchemaName].[$LogTable] exist..."
     Initialize-Tables -Connection $connection -Schema $SchemaName -DataTbl $DataTable -LogTbl $LogTable
 
-    $csvFiles = Get-ChildItem -LiteralPath $ReportsPath -Filter "*.csv" -File
+    $csvFiles = Get-ChildItem -LiteralPath $ReportsPath -Filter "*FolderReport_Depth6.csv" -File
     if ($csvFiles.Count -eq 0) {
         Write-Host "No CSV files found in $ReportsPath"
         return

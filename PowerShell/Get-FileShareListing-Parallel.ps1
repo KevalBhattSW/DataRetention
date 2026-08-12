@@ -89,7 +89,11 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 function Add-ContentSafe {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Value,
+        # Accepts a single line or an array of lines. Passing the whole batch
+        # as one array means one open/close of the (possibly SMB) output file
+        # per flush instead of one per row — far less chance of a sharing
+        # violation, and much faster over a UNC path.
+        [Parameter(Mandatory)][string[]]$Value,
         [int]$MaxRetries = 5,
         [int]$RetryDelayMs = 200
     )
@@ -301,6 +305,13 @@ function Invoke-FlushBatch {
 
     $rows = Wait-AndCollectJobs -BatchResult $batchResult
 
+    # Build every line for this batch first, then write them all in a single
+    # Add-ContentSafe call. Writing one line at a time meant one open/close of
+    # the output file per row; over an SMB/UNC path the handle doesn't always
+    # release before the next open, which is what produced the "being used by
+    # another process" IOException. One retry-guarded write per flush fixes it
+    # and is dramatically faster.
+    $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($row in $rows) {
         if ($null -eq $row -or -not $row.Name -or -not $row.ContainingPath) { continue }
         $listEntry = @(
@@ -308,7 +319,11 @@ function Invoke-FlushBatch {
             $row.LastAccessed, $row.CreationDate, $row.Extension,
             $row.LastSaveDate, $row.DateChecked
         ) -Join [char]9
-        Add-Content -Path $outputFile -Value $listEntry
+        $lines.Add($listEntry)
+    }
+
+    if ($lines.Count -gt 0) {
+        Add-ContentSafe -Path $outputFile -Value $lines.ToArray()
     }
 
     $processedCount.Value += $batch.Count

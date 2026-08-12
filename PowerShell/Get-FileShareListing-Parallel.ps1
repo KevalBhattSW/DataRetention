@@ -167,10 +167,21 @@ function Process-FileListingBatch {
 
             # Translate the temporary drive letter back to the share's UNC path
             # so the output doesn't depend on which letter was free this run.
+            # Match the leading "<letter>:" case-insensitively — Get-Item often
+            # returns DirectoryName with an upper-case drive letter even when the
+            # drive was mapped/enumerated in lower case, so a case-sensitive
+            # StartsWith would silently skip the translation and leave "Z:\..."
+            # in the output. The regex also strips a following separator (or
+            # none, for files in the share root) safely.
             if ($driveLetter -and $mappedPath) {
-                if ($filePath.StartsWith("$driveLetter`:")) {
-                    $relativePath = $filePath.Substring(3)
-                    $filePath = Join-Path -Path $mappedPath -ChildPath $relativePath
+                $escapedLetter = [regex]::Escape($driveLetter)
+                if ($filePath -match "^$escapedLetter`:(.*)$") {
+                    $relativePath = $matches[1].TrimStart('\')
+                    $filePath = if ($relativePath) {
+                        Join-Path -Path $mappedPath -ChildPath $relativePath
+                    } else {
+                        $mappedPath        # file sits directly in the share root
+                    }
                 }
             }
 
@@ -487,7 +498,7 @@ try {
                         if ($cols.Count -ge 2 -and $cols[0] -and $cols[1]) {
                             $storedPath = Join-Path -Path $cols[1] -ChildPath $cols[0]
 
-                            if ($DriveLetter -and $MappedPath -and $storedPath.StartsWith($MappedPath)) {
+                            if ($DriveLetter -and $MappedPath -and $storedPath.StartsWith($MappedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
                                 $relative   = $storedPath.Substring($MappedPath.Length).TrimStart('\')
                                 $storedPath = "$DriveLetter`:\$relative"
                             }

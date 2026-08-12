@@ -336,12 +336,35 @@ Tagging makes the files *actionable*; reporting makes the estate *visible*. Thes
 
 | Script | Purpose |
 |---|---|
+| `Get-FileListing-Functions-Servers-Parallel.ps1` | The parallel file-listing engine for on-server drives — the architectural template the file-share listing below is built on. Walks one or more server drives in parallel runspaces, streams batched metadata rows to a tab-delimited output, and supports resume. |
+| `Get-FileShareListing-Parallel.ps1` | The **Azure file share** counterpart to the servers listing (see §8.1). Maps the share, walks it in parallel, and produces a **single** tab-delimited listing for the whole share, ready for SQL load. |
 | `UDR-FolderReport.ps1` | Walks the target drive in parallel and produces CSV reports of folder contents — file counts, subfolder counts, total size, and a breakdown by file type (PDF / legacy-COM / OpenXML / Other). Runs in `Depth`, `Full`, or `Both` mode; resolves mapped drive letters to UNC paths first. |
 | `Load-FolderReportsToSql.ps1` | Bulk-loads the folder-report CSVs into SQL Server, tracking each file by name + SHA256 hash + row count so re-runs skip already-loaded files. |
 | `Load-AddPropertiesStatusToSql.ps1` | Loads the pipe-delimited `*AddPropertiesStatus*.txt` progress files (produced by the tagging run) into SQL, detecting New / Unchanged / Changed files by hash and reloading only what changed. |
 | `Load-CatalogueDataToSql.ps1` | Stages tab-delimited catalogue extracts into SQL, enriching rows with parsed dates, file-type, and retention-scope flags. Uses size + last-write-time (not content hash) for change detection specifically so it doesn't *hydrate* online-only SharePoint/OneDrive placeholders just to check them. |
+| `Load-FileShareDataToSql.ps1` | Companion loader for the Azure file share listing (see §8.1). A sibling of `Load-CatalogueDataToSql.ps1` with identical enrichment/staging/change-detection logic, but defaulting to its own SQL tables so the file-share dataset lands separately. |
 
 Together these give a queryable picture in SQL of where the in-scope, out-of-retention files are, which supports the quarantine decisions.
+
+### 8.1 Azure file share cataloguing (`Get-FileShareListing-Parallel.ps1` + `Load-FileShareDataToSql.ps1`)
+
+Alongside the on-server drives, the estate includes **Azure file shares**, which need cataloguing into the same SQL reporting so their contents are visible for retention/quarantine decisions. This pair does that.
+
+**`Get-FileShareListing-Parallel.ps1`** rebuilds the sequential file-share listing on the same parallel architecture as `Get-FileListing-Functions-Servers-Parallel.ps1`, so it behaves consistently with the rest of the reporting. Its distinct behaviours are:
+
+- **Share mapping.** It finds a free drive letter (scanning **Z→A**) and maps the Azure file share (`\\{{storage account}}.file.core.windows.net\{{share name}}`) with `New-PSDrive`, walks the share via that temporary letter, and **translates every stored `ContainingPath` back to the share's UNC path** so the output doesn't depend on which letter happened to be free. The drive is **always unmapped** on exit (success, failure, or `Ctrl-C`) via a `finally` block.
+- **Single output per share.** Unlike the multi-file server listings, it writes **one** fixed-name, tab-delimited output for the whole share (no datestamp), so a resumed run appends to the same file. The progress log *is* datestamped so each run/resume gets a clean log.
+- **Parallelism & memory.** Runspace-pool parallelism (`-ParallelItems`) with streamed batch flushing (`-BatchSize`) — it never holds the whole file list in memory.
+- **Snapshot exclusion.** It skips any `~snapshot` folder (Azure Files exposes **share snapshots** under that name, which would otherwise be walked and double-count files) as well as Office `~$` lock files.
+- **Resume.** R/O/X resume detection (Resume / Overwrite / eXit at the prompt): a resumed run reloads already-processed paths and appends only new ones. *(If a previous listing was produced with malformed drive-letter paths, choose **Overwrite** rather than Resume — a resume keeps the old rows and only fixes newly-added ones.)*
+- **Credentials.** Takes an optional `-Credential`. Omit it to use the ambient identity (the `{{windows domain}}\UDRTagging` account); for a **storage-account-key** mount, supply a `PSCredential` whose username is `AZURE\{{storage account}}` (or `localhost\{{storage account}}`) and whose password is the storage account key.
+
+**`Load-FileShareDataToSql.ps1`** is a sibling of `Load-CatalogueDataToSql.ps1`, following the project's one-loader-per-dataset convention. It is functionally identical — same server/database, same enrichment SQL and columns, same size+last-write-time change detection, staging, batched insert, and load-history — **except** its target/staging/history tables default to the file-share dataset's own tables (e.g. `dbo.fileshare_data*`) and its `-SourceFolder` points at the `FileShare` subfolder the listing script writes to. Point both at the same table names if you ever want the file-share and catalogue datasets merged.
+
+> **Operational notes for this pair:**
+> - **Working-path convention is shared between the two scripts.** The listing writes to `<WorkingPath>\FileShare\<share>_FileShareListing.txt`; the loader's `-SourceFolder` defaults to the matching `…\FileListing\FileShare` folder. If you change `-WorkingPath` on the writer, update `-SourceFolder` on the loader to match, or the load finds nothing.
+> - **Re-sign after any edit.** Like every script here, it runs under `AllSigned`, so run the appropriate `Sign-*` step over it before running — any edit invalidates the previous signature (see §4).
+> - **Placeholders.** The storage-account FQDN, share name, and working-path server have been shown as placeholders (`{{storage account}}`, `{{share name}}`) for security — substitute the real values in your controlled copy of the scripts/pipeline.
 
 ---
 
@@ -354,6 +377,7 @@ Together these give a queryable picture in SQL of where the in-scope, out-of-ret
 - **Paths:** verify the Python executable path and the PDF helper filename on each server; verify `ScriptPath` / `DrivePath` pipeline variables use **UNC**, not user-session drive mappings.
 - **Timeouts:** the ADO job timeout must be set generously (the default 60 minutes is too short for large shares); the tagging script's resume logic means an interrupted run continues, but a mid-run kill still leaves partial state.
 - **Failure signals:** exit code **42** = RPC failure, intended to trigger a pipeline retry. "Agent not contactable" after detachment is confirmed → check for orphaned `WINWORD`/`EXCEL`/`POWERPNT` processes and trend handle/memory usage.
+- **Azure file share cataloguing:** when running `Get-FileShareListing-Parallel.ps1`, keep its `-WorkingPath` and the loader's `-SourceFolder` in sync, ensure a free drive letter is available for the `New-PSDrive` mount, and supply `-Credential` (username `AZURE\{{storage account}}`, password = storage key) only if the ambient `{{windows domain}}\UDRTagging` identity can't reach the share. If a prior listing has bad drive-letter paths, **Overwrite** rather than **Resume**.
 - **Invisibility:** the whole point is that tagging doesn't disturb the business — confirm timestamps and read-only flags are being restored (they're logged), so tagged files don't suddenly look recently modified.
 
 ---

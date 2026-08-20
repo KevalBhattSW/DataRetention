@@ -227,6 +227,36 @@ function Remove-PreviousFileRows {
 }
 
 # ---------------------------------------------------------------------------
+# Remove a file, retrying with backoff if it's briefly locked. Small files
+# in particular can still show as "in use" for a moment right after
+# Compress-Archive finishes with them — the underlying handle (held by
+# Compress-Archive itself, AV real-time scanning, or file-server/OneDrive
+# sync) isn't always released the instant the cmdlet returns. Retrying
+# beats failing the whole zip/delete step for what's usually a sub-second
+# race.
+# ---------------------------------------------------------------------------
+function Remove-ItemWithRetry {
+    param(
+        [string]$Path,
+        [int]$MaxAttempts = 6,
+        [int]$InitialDelayMs = 250
+    )
+
+    $delay = $InitialDelayMs
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($attempt -eq $MaxAttempts) { throw }
+            Start-Sleep -Milliseconds $delay
+            $delay = [Math]::Min($delay * 2, 4000)
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Zip an unchanged source file in place and delete the original, to reduce
 # space used on the file server. The file's data is already safely loaded
 # in SQL and, being unchanged, won't be reloaded — the zip replaces it as
@@ -240,10 +270,10 @@ function Compress-AndRemoveSourceFile {
     $zipPath = "$FilePath.zip"
     try {
         if (Test-Path -LiteralPath $zipPath) {
-            Remove-Item -LiteralPath $zipPath -Force
+            Remove-ItemWithRetry -Path $zipPath
         }
         Compress-Archive -LiteralPath $FilePath -DestinationPath $zipPath -CompressionLevel Optimal
-        Remove-Item -LiteralPath $FilePath -Force
+        Remove-ItemWithRetry -Path $FilePath
         Write-Host "       zipped and removed original -> $(Split-Path -Leaf $zipPath)"
     }
     catch {

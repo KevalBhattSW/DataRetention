@@ -10,7 +10,8 @@
     is New, Unchanged, or Changed since it was last loaded, and bulk-loads
     accordingly:
       - New       -> load
-      - Unchanged -> skip
+      - Unchanged -> skip (and zip the file in place, replacing it, since
+                     its data is already safely loaded and won't change)
       - Changed   -> delete previously loaded rows for that file, then reload
 
 .PARAMETER ReportsPath
@@ -223,6 +224,31 @@ function Remove-PreviousFileRows {
     $cmd.CommandText = "DELETE FROM [$Schema].[$DataTbl] WHERE SourceFile = @FileName"
     $cmd.Parameters.AddWithValue("@FileName", $FileName) | Out-Null
     return $cmd.ExecuteNonQuery()
+}
+
+# ---------------------------------------------------------------------------
+# Zip an unchanged source file in place and delete the original, to reduce
+# space used on the file server. The file's data is already safely loaded
+# in SQL and, being unchanged, won't be reloaded — the zip replaces it as
+# a compressed archive copy. Because the replacement is a .zip, it will no
+# longer match -FileFilter on future runs, so it naturally drops out of
+# scanning once archived.
+# ---------------------------------------------------------------------------
+function Compress-AndRemoveSourceFile {
+    param([string]$FilePath)
+
+    $zipPath = "$FilePath.zip"
+    try {
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+        Compress-Archive -LiteralPath $FilePath -DestinationPath $zipPath -CompressionLevel Optimal
+        Remove-Item -LiteralPath $FilePath -Force
+        Write-Host "       zipped and removed original -> $(Split-Path -Leaf $zipPath)"
+    }
+    catch {
+        Write-Warning "       failed to zip/remove '$FilePath': $($_.Exception.Message)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -558,6 +584,7 @@ try {
         if ($status -eq "Unchanged") {
             Write-Host "SKIP   $($file.Name) — already loaded, unchanged"
             $skipped++
+            Compress-AndRemoveSourceFile -FilePath $file.FullName
             continue
         }
 

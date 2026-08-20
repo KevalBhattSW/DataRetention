@@ -14,8 +14,9 @@
               does not download/hydrate a OneDrive/SharePoint placeholder).
            b. Compare those to the values recorded the last time this
               SourceFile was loaded (dbo.catalogue_data_load_history).
-              - If both match: skip the file entirely (no copy, no load,
-                no hydration).
+              - If both match: skip the file entirely (no copy, no load).
+                The file is then zipped in place (replacing the original)
+                to free up space on the file server — see note below.
               - If new or either has changed: proceed to load it.
            c. Copy the file into WorkFolder (this is what hydrates a
               not-yet-downloaded SharePoint/OneDrive file).
@@ -45,6 +46,12 @@
     move the size or the last-write timestamp (rare, but possible with
     some sync/copy tools) won't be detected; use -ForceReload to bypass
     the check for a specific run if that's a concern.
+
+    Zipping an unchanged file (see Step 2b) DOES require reading its full
+    content, so it hydrates a not-yet-downloaded file just like loading
+    would. This only happens once per file though: after it's zipped, the
+    original is deleted and the .zip no longer matches the *.txt filter,
+    so the file drops out of scanning on every subsequent run.
 #>
 
 [CmdletBinding()]
@@ -341,6 +348,35 @@ function Invoke-Dehydrate {
     }
 }
 
+# Zips an unchanged source file in place and deletes the original, to
+# reduce space used on the file server. The file's data is already safely
+# loaded in SQL and, being unchanged (same size + last-write-time as the
+# last successful load), won't be reloaded — the zip replaces it as a
+# compressed archive copy. Because the replacement is a .zip, it no longer
+# matches the *.txt filter used in Step 2, so it naturally drops out of
+# scanning on every subsequent run.
+#
+# NOTE: unlike the size+date check itself, this DOES read the file's full
+# content, so it will hydrate a not-yet-downloaded SharePoint/OneDrive
+# placeholder — but only once, since the file is removed from SourceFolder
+# immediately afterwards.
+function Compress-AndRemoveSourceFile {
+    param([string]$FilePath)
+
+    $zipPath = "$FilePath.zip"
+    try {
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+        Compress-Archive -LiteralPath $FilePath -DestinationPath $zipPath -CompressionLevel Optimal
+        Remove-Item -LiteralPath $FilePath -Force
+        Write-Host "         zipped and removed original -> $(Split-Path -Leaf $zipPath)" -ForegroundColor DarkYellow
+    }
+    catch {
+        Write-Warning "         failed to zip/remove '$FilePath': $($_.Exception.Message)"
+    }
+}
+
 # Streams SourcePath -> DestinationPath in chunks, reporting byte-level
 # progress via Write-Progress as it goes. Used in place of Copy-Item so we
 # get a progress bar; as a side effect this is also the only point at
@@ -536,6 +572,7 @@ foreach ($f in $plainFiles) {
 
     if (-not $ForceReload -and $unchanged) {
         Write-LogEntry -File $f.Name -Status "SKIPPED" -Detail "Unchanged since last load (size+date match)"
+        Compress-AndRemoveSourceFile -FilePath $f.FullName
         continue
     }
     # ------------------------------------------------------------------
@@ -820,7 +857,7 @@ $totalRows    = ($logEntries | Where-Object Status -eq "SUCCESS" | Measure-Objec
 
 Write-Host "`n=== Summary ===" -ForegroundColor Cyan
 Write-Host "  Succeeded : $successCount" -ForegroundColor Green
-Write-Host "  Skipped   : $skippedCount (unchanged since last load)" -ForegroundColor Yellow
+Write-Host "  Skipped   : $skippedCount (unchanged since last load, zipped in place)" -ForegroundColor Yellow
 Write-Host "  Failed    : $failCount"    -ForegroundColor $(if ($failCount -gt 0) {"Red"} else {"Green"})
 Write-Host "  Total rows: $totalRows"
 Write-Host "  Log       : $LogFile"

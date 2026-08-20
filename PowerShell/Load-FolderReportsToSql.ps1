@@ -8,7 +8,9 @@
     checks a tracking table to see if each file has already been imported,
     and bulk-loads any new ones. Each successfully loaded file is recorded
     in the tracking table (filename + SHA256 hash + row count + timestamp)
-    so reruns are safe and cheap.
+    so reruns are safe and cheap. A file found unchanged since its last
+    successful load is zipped in place (replacing the original) to reduce
+    space used on the file server.
 
 .PARAMETER ReportsPath
     Folder containing the CSV files to load (e.g. the FolderReports dir
@@ -210,6 +212,31 @@ function Remove-PreviousFileRows {
 }
 
 # ---------------------------------------------------------------------------
+# Zip an unchanged source file in place and delete the original, to reduce
+# space used on the file server. The file's data is already safely loaded
+# in SQL and, being unchanged, won't be reloaded — the zip replaces it as
+# a compressed archive copy. Because the replacement is a .zip, it will no
+# longer match the *.csv filter on future runs, so it naturally drops out
+# of scanning once archived.
+# ---------------------------------------------------------------------------
+function Compress-AndRemoveSourceFile {
+    param([string]$FilePath)
+
+    $zipPath = "$FilePath.zip"
+    try {
+        if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+        Compress-Archive -LiteralPath $FilePath -DestinationPath $zipPath -CompressionLevel Optimal
+        Remove-Item -LiteralPath $FilePath -Force
+        Write-Host "       zipped and removed original -> $(Split-Path -Leaf $zipPath)"
+    }
+    catch {
+        Write-Warning "       failed to zip/remove '$FilePath': $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Record the outcome of a load attempt
 # ---------------------------------------------------------------------------
 function Write-LoadLogEntry {
@@ -345,6 +372,7 @@ try {
         if ($status -eq "Unchanged") {
             Write-Host "SKIP   $($file.Name) — already loaded, unchanged"
             $skipped++
+            Compress-AndRemoveSourceFile -FilePath $file.FullName
             continue
         }
 

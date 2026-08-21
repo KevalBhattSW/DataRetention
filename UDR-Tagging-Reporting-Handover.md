@@ -60,6 +60,8 @@ A key design principle throughout: **tagging must be invisible to the business.*
 
 > **Note — hosted agents will not work.** Microsoft-hosted ADO agents do not have Office installed, so COM automation would fail immediately. This is why **self-hosted agents on Office-equipped servers** are used.
 
+**Scheduling which drive runs where and when.** With multiple servers and many drives to work through, a small Excel model (`UDR_Execution_Scheduler.xlsx`) plans the run order: each drive has a forecasted duration, each server can only run one drive at a time, and drives can be prioritised either by **location** or by **volume** (largest first). Per-server availability can be overridden (e.g. when a server is mid-job) so the plan re-simulates around real start times rather than a single shared start. This is a planning aid for deciding *which* drive goes to *which* server *next* — it doesn't drive the pipeline itself, but is the source for the `DrivePath` values fed into pipeline runs.
+
 **High-level flow of a run:**
 
 1. Pipeline triggers the PowerShell task on the chosen server.
@@ -269,7 +271,7 @@ Invoke-ExecuteTaggingSafely
 | `Add-ContentSafe` | Thread-safe append-to-file with retry/back-off — used everywhere for logging, since many parallel runspaces write to the same log files. |
 | `Write-Log` / `Write-LogProcess` | Structured log writers (per-file messages and a pipe-delimited progress/status record used by the SQL loader). |
 | `Test-FileExists` / `Test-FileLocked` | Pre-flight checks (with retries) to skip files that are missing or open/locked before spending effort on them. |
-| `Start-KillProcessMonitor` / `Stop-KillProcessMonitor` | Launch/stop an **external watchdog** PowerShell process that periodically kills any `WINWORD`/`EXCEL`/`POWERPNT` that has been running longer than a threshold — the safety net against a COM call hanging on a single bad file and stalling the whole run. |
+| `Start-KillProcessMonitor` / `Stop-KillProcessMonitor` | Launch/stop an **external watchdog** PowerShell process that periodically kills any `WINWORD`/`EXCEL`/`POWERPNT` that has been running longer than a threshold — the safety net against a COM call hanging on a single bad file and stalling the whole run. The monitor **self-restarts on a fatal error** (up to 10 restarts, 5-second pause between, each restart logged with its count) rather than dying silently, and runs fully unattended — an earlier version's blocking `Read-Host` was removed so it can never sit waiting for input on a headless run. |
 | `Invoke-ExecuteTaggingSafely` | Top-level wrapper: starts the kill-monitor, runs `Execute_Tagging`, drains any lingering Office processes on completion, stops the monitor, and sets a clean exit code — **except** it deliberately exits with code **42** on an RPC failure so the pipeline can detect it and **restart** the run. |
 
 ### 6.3 What each section should do (detailed)
@@ -288,7 +290,7 @@ Invoke-ExecuteTaggingSafely
 
 **PDF processing (`Process-PdfBatch`).** Delegates to the Python helper (see §7), one process per file, reading the return code to record success / encrypted / signed / error. Uses the Python-installed path configured near the top of the function — **verify this path on any new server** (it's a common break point).
 
-**Kill-monitor section (`Start-KillProcessMonitor`).** Builds a self-contained monitor script, base64-encodes it, and launches it as an independent PowerShell process that loops, killing long-running Office processes and restarting itself on error. This runs alongside the main tagging work and is stopped (after draining Office) when tagging completes.
+**Kill-monitor section (`Start-KillProcessMonitor`).** Builds a self-contained monitor script, base64-encodes it, and launches it as an independent PowerShell process that loops, killing long-running Office processes and restarting itself on error. The monitor is wrapped in an outer restart loop (up to **10 restarts**, a **5-second** pause between each, with the restart count written to the log every time) so a transient fault in the watchdog itself doesn't silently take the safety net offline for the rest of a long run — genuine per-file errors inside the loop are logged as warnings and don't count as a restart, only a fatal exception does. It also has **no interactive prompts** (an earlier version's `Read-Host` was removed), which matters because this process is meant to run unattended for the full duration of the pipeline job. This runs alongside the main tagging work and is stopped (after draining Office) when tagging completes.
 
 **Bottom-of-file execution.** Sets `$global:RpcFailureDetected = $false`, calls `Invoke-ExecuteTaggingSafely`, and if an RPC failure was detected emits `##[error]Restart required due to RPC failure` and **exits 42** — the signal the pipeline uses to retry.
 
@@ -340,7 +342,7 @@ Tagging makes the files *actionable*; reporting makes the estate *visible*. Thes
 | `Get-FileShareListing-Parallel.ps1` | The **Azure file share** counterpart to the servers listing (see §8.1). Maps the share, walks it in parallel, and produces a **single** tab-delimited listing for the whole share, ready for SQL load. |
 | `UDR-FolderReport.ps1` | Walks the target drive in parallel and produces CSV reports of folder contents — file counts, subfolder counts, total size, and a breakdown by file type (PDF / legacy-COM / OpenXML / Other). Runs in `Depth`, `Full`, or `Both` mode; resolves mapped drive letters to UNC paths first. |
 | `Load-FolderReportsToSql.ps1` | Bulk-loads the folder-report CSVs into SQL Server, tracking each file by name + SHA256 hash + row count so re-runs skip already-loaded files. |
-| `Load-AddPropertiesStatusToSql.ps1` | Loads the pipe-delimited `*AddPropertiesStatus*.txt` progress files (produced by the tagging run) into SQL, detecting New / Unchanged / Changed files by hash and reloading only what changed. |
+| `Load-AddPropertiesStatusToSql.ps1` | Loads the pipe-delimited `*AddPropertiesStatus*.txt` progress files (produced by the tagging run) into SQL, detecting New / Unchanged / Changed files by hash and reloading only what changed. Now searches **recursively** (`-Recurse`) under `-ReportsPath`, so status files sitting in subfolders are picked up too — previously it only looked directly inside the given folder. *(Note: matching is still by filename only, not full path — if status files with identical names ever exist in two different subfolders, the second is treated as already-loaded and skipped. Not expected to occur given the timestamped naming, but worth knowing if the folder layout changes.)* |
 | `Load-CatalogueDataToSql.ps1` | Stages tab-delimited catalogue extracts into SQL, enriching rows with parsed dates, file-type, and retention-scope flags. Uses size + last-write-time (not content hash) for change detection specifically so it doesn't *hydrate* online-only SharePoint/OneDrive placeholders just to check them. |
 | `Load-FileShareDataToSql.ps1` | Companion loader for the Azure file share listing (see §8.1). A sibling of `Load-CatalogueDataToSql.ps1` with identical enrichment/staging/change-detection logic, but defaulting to its own SQL tables so the file-share dataset lands separately. |
 
@@ -365,6 +367,39 @@ Alongside the on-server drives, the estate includes **Azure file shares**, which
 > - **Working-path convention is shared between the two scripts.** The listing writes to `<WorkingPath>\FileShare\<share>_FileShareListing.txt`; the loader's `-SourceFolder` defaults to the matching `…\FileListing\FileShare` folder. If you change `-WorkingPath` on the writer, update `-SourceFolder` on the loader to match, or the load finds nothing.
 > - **Re-sign after any edit.** Like every script here, it runs under `AllSigned`, so run the appropriate `Sign-*` step over it before running — any edit invalidates the previous signature (see §4).
 > - **Placeholders.** The storage-account FQDN, share name, and working-path server have been shown as placeholders (`{{storage account}}`, `{{share name}}`) for security — substitute the real values in your controlled copy of the scripts/pipeline.
+
+### 8.2 Catalogue loader — SharePoint/OneDrive-aware evolution (`Stage-CatalogueData.ps1`)
+
+A further-developed variant of `Load-CatalogueDataToSql.ps1`, built to be safe against **synced SharePoint/OneDrive folders**, where files can appear as **online-only placeholders** that haven't actually been downloaded to disk. Same core job (stage → enrich → insert, with a load-history table so unchanged files are skipped) but two points evolved beyond the base loader and are worth knowing if you're comparing the two or deciding which is authoritative in your deployment:
+
+- **Change detection was deliberately moved away from a content hash.** An earlier iteration used `Get-FileHash` (SHA256), but that requires reading the file's actual bytes — which **forces a placeholder to hydrate (download)** even when it turns out to be unchanged, silently pulling every file in the folder down over the network just to check it. It was replaced with the same **size + `LastWriteTimeUtc`** comparison the base loader uses, read straight from `Get-ChildItem`'s placeholder metadata, so an unchanged file is never touched. The load-history table's `FileHash` column is kept (nullable) for backward compatibility with any history table built under the old version, rather than dropped.
+- **New `-DehydrateAfterProcessing` switch.** After a file has been loaded (or confirmed unchanged), this optionally converts it back to an online-only placeholder, so a full run doesn't leave the entire synced folder pinned to local disk. It's a no-op on the skip path (skipped files are never hydrated to begin with) and mainly matters for files that were actually copied and loaded this run.
+
+> **Confirm which loader is in production before treating this as authoritative.** This document lists `Load-CatalogueDataToSql.ps1` in the reporting table above as the established loader; `Stage-CatalogueData.ps1` reflects a later refinement of the same logic. If both exist in your environment, check with whoever actioned this change which one the pipeline currently calls, and update this document to name the correct one going forward.
+
+### 8.3 Running loader scripts unattended (Windows Task Scheduler)
+
+Where a loader (e.g. `Load-AddPropertiesStatusToSql.ps1`) needs to run on a schedule outside the ADO pipeline — for example, a periodic refresh independent of a tagging run — it can be configured as a **Windows Scheduled Task**. A bare `powershell.exe` + relative-path setup is fragile under Task Scheduler because the task runs in a different security context with no profile; use this configuration instead:
+
+- **Program/script:** `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`
+- **Arguments:** `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\full\path\to\Load-AddPropertiesStatusToSql.ps1" -ReportsPath "<path>" -SqlServer "<server>" -database "unstrdata"`
+- **Start in:** the folder containing the script
+
+Why each switch matters:
+
+| Switch | Reason |
+|---|---|
+| `-File` with a **full absolute path** | Task Scheduler doesn't reliably honour "Start in" depending on how the task is launched — a bare relative path can silently fail to resolve. |
+| `-ExecutionPolicy Bypass` | Scheduled tasks run under a different security context than an interactive session; if that context's effective policy is `Restricted` or `AllSigned` (see §4), the script can fail to run at all without this. |
+| `-NoProfile` | Skips PowerShell profile scripts, avoiding failures from a profile referencing modules/paths that don't exist in the scheduled-task context. |
+| `-NonInteractive` | Stops PowerShell hanging indefinitely if anything unexpectedly prompts (e.g. a credential dialog) — without a console to respond to, the task would otherwise sit "running" forever. |
+
+Other configuration to set:
+
+- **Run as account:** the account running the task needs read access to `-ReportsPath` (if it's a UNC path — a mapped drive letter set up under an interactive login won't exist in the scheduled task's session) and the appropriate SQL Server login/permissions on the target database.
+- **"Run whether user is logged on or not"** — needed if the task must run unattended with nobody logged in; pair with "Run with highest privileges" if elevation is required.
+- **A timeout setting** ("Stop the task if it runs longer than…") as a safety net, and a decision on whether to retry on failure.
+- **Logging:** if the script doesn't already log internally, redirect output for troubleshooting (Task Scheduler's own stdout capture is limited).
 
 ---
 
